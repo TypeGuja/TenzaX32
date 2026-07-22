@@ -1,0 +1,10 @@
+[package]
+name = "pony-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+ron.workspace = true
+glam.workspace = true
+thiserror.workspace = true
