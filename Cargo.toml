@@ -2,15 +2,38 @@
 resolver = "2"
 members = [
     "crates/pony-core",
+    "crates/pony-system",
+    "crates/pony-render",
+    "crates/pony-script",
+    "crates/pony-gui",
     "crates/pony-cli",
 ]
+# Единая точка входа: `cargo run` без -p запускает GUI. pony-cli остаётся
+# в workspace (внутренний диагностический харнесс — печатает профиль
+# системы, гоняет headless-рендер и т.д.), но им теперь не обязательно
+# управлять напрямую: то же самое (кроме печати в консоль) видно в GUI.
+default-members = ["crates/pony-gui"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-ron = "0.8"
-glam = { version = "0.27", features = ["serde"] }
-thiserror = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+ron = "0.12"
+glam = { version = "0.33", features = ["serde"] }
+thiserror = "2.0"
+sysinfo = "0.30"
+# Потолок для ЭТОГО контейнера: 0.20+ требует Cargo-фичу edition2024,
+# для которой нужен cargo >= 1.85 (в контейнере зашит 1.75 через apt,
+# новее взять неоткуда — rustup/static.rust-lang.org недоступны из песочницы).
+# На реальной машине с современным тулчейном смело поднимай:
+# `cargo update -p wgpu` возьмёт актуальную (на момент правки — 30.x),
+# но это ПОТРЕБУЕТ миграции API (Instance/Device/enumerate_adapters
+# заметно поменялись между 0.19 и 30) — я её не проверял вживую, раз
+# здесь физически не могу это скомпилировать.
+wgpu = "0.19"
+# Тот же потолок: rayon 1.9+ тянет rayon-core, которому нужен rustc 1.80+.
+rayon = "=1.8.1"
+pollster = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
