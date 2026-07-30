@@ -1,0 +1,29 @@
+[package]
+name = "pony-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pony-core = { path = "../pony-core" }
+pony-render = { path = "../pony-render" }
+pony-script = { path = "../pony-script" }
+pony-system = { path = "../pony-system" }
+wgpu.workspace = true
+pollster.workspace = true
+
+# Собраны напрямую (без `eframe`), чтобы не тащить принудительную
+# wayland/smithay-clipboard зависимость eframe (см. README, раздел про
+# версии) — eframe жёстко требует egui-winit с фичей "clipboard", которая
+# тянет smithay-clipboard -> wayland-protocols 0.32+, требующий
+# edition2024. Ручная сборка из egui + egui-winit + egui-wgpu + winit с
+# отобранными вручную фичами (только x11, без clipboard/wayland) этого
+# избегает — тот же результат, без потолка этой песочницы.
+egui = { version = "0.27", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.27", default-features = false, features = ["x11"] }
+egui-wgpu = "0.27"
+winit = { version = "0.29", default-features = false, features = ["x11", "rwh_06"] }
+
+# Транзитивные пины под rustc 1.75 этой песочницы (не нужны на современном
+# тулчейне — см. README "Версии зависимостей").
+indexmap = "=2.2.6"
+rustc-hash = "=2.0.0"

@@ -1,0 +1,22 @@
+[package]
+name = "pony-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pony-core = { path = "../pony-core" }
+pony-system = { path = "../pony-system" }
+wgpu.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+# Последняя версия под 0.24 линии — 0.25+ тянет transitive-зависимость с
+# требованием edition2024 (см. пояснение про wgpu/rayon в README).
+image = { version = "0.24", default-features = false, features = ["png"] }
+# SVG-растеризация. Потолок этой песочницы — 0.44: 0.45+ тянет image-webp,
+# которому нужен rustc 1.80+; 0.46+ у usvg уже сам требует edition2024.
+resvg = "0.44"
+usvg = "0.44"
+tiny-skia = "0.11"
+gif = "0.13"

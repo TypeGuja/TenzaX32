@@ -1,9 +1,466 @@
 use pony_core::animation::{AnimTarget, AnimValue, Animation, BoneChannel, Interpolation, Keyframe, Track};
 use pony_core::part::{Part, PartKind, PartSource};
 use pony_core::skeleton::default_pony_skeleton;
-use pony_core::Character;
+use pony_core::{Camera, Character};
+use pony_render::{export_gif, RenderCluster, Renderer};
+use pony_script::ScriptEngine;
+use pony_system::{GpuAssignment, SystemProfile, WorkloadPolicy};
+use std::io::Write;
+
+/// Определяем систему, считаем политику ресурсов и поднимаем то, что
+/// реально доступно (0 GPU -> CPU-only, N GPU -> кластер контекстов).
+/// Ничего не захардкожено под конкретную машину.
+fn report_system_and_build_runtime() -> (SystemProfile, WorkloadPolicy, rayon::ThreadPool, RenderCluster) {
+    let profile = SystemProfile::detect();
+    let policy = WorkloadPolicy::from_profile(&profile);
+
+    println!("=== Профиль системы ===");
+    println!(
+        "CPU: {} логических / {} физических ядер",
+        profile.cpu.logical_cores, profile.cpu.physical_cores
+    );
+    println!(
+        "Память: {:.1} ГиБ доступно из {:.1} ГиБ всего",
+        profile.memory.available_bytes as f64 / 1e9,
+        profile.memory.total_bytes as f64 / 1e9
+    );
+    if profile.gpus.is_empty() {
+        println!("GPU: не обнаружено — работаем в CPU-only режиме");
+    } else {
+        for gpu in &profile.gpus {
+            println!(
+                "GPU[{}]: {} ({}, {:?}, вес {:.2})",
+                gpu.index,
+                gpu.name,
+                gpu.backend,
+                gpu.device_type,
+                gpu.device_type.relative_weight()
+            );
+        }
+    }
+
+    println!("\n=== Политика ресурсов (вычислена из профиля) ===");
+    println!("Рабочих потоков rayon: {}", policy.worker_threads);
+    println!(
+        "Бюджет памяти под кэш движка: {:.1} ГиБ",
+        policy.memory_budget_bytes as f64 / 1e9
+    );
+    match &policy.gpu_assignment {
+        GpuAssignment::None => println!("GPU-назначение: нет (CPU-only рендер)"),
+        GpuAssignment::Single(i) => println!("GPU-назначение: один адаптер #{i}"),
+        GpuAssignment::Multi(w) => println!("GPU-назначение: несколько адаптеров, доли {w:?}"),
+    }
+
+    let thread_pool = pony_system::build_thread_pool(&policy);
+    let render_cluster = pollster::block_on(RenderCluster::initialize(&profile, &policy.gpu_assignment))
+        .unwrap_or_default();
+
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер: пуст, реального устройства не поднято (ожидаемо без GPU-драйверов в этой среде)");
+    } else {
+        println!("Рендер-кластер: {} активных GPU-контекст(ов)", render_cluster.contexts.len());
+    }
+
+    (profile, policy, thread_pool, render_cluster)
+}
 
 fn main() {
+    let (_profile, policy, thread_pool, render_cluster) = report_system_and_build_runtime();
+
+    // Демонстрация того, зачем нужен пул: параллельно считаем мировые
+    // трансформации костей для N "виртуальных" персонажей на сцене —
+    // именно так в реальном рендере распараллелится скелетная анимация
+    // множества персонажей между доступными ядрами.
+    let skeleton = default_pony_skeleton();
+    let scene_characters = 64usize;
+    let bone_ids: Vec<&str> = skeleton.bones.iter().map(|b| b.id.as_str()).collect();
+
+    let world_positions: Vec<usize> = thread_pool.install(|| {
+        use rayon::prelude::*;
+        (0..scene_characters)
+            .into_par_iter()
+            .map(|_char_idx| {
+                // На каждого персонажа — пересчёт всех костей скелета.
+                bone_ids
+                    .iter()
+                    .filter_map(|id| skeleton.world_transform(id))
+                    .count()
+            })
+            .collect()
+    });
+    println!(
+        "\nПересчитано {} костей суммарно по {} персонажам на {} rayon-потоках",
+        world_positions.iter().sum::<usize>(),
+        scene_characters,
+        policy.worker_threads
+    );
+
+    println!();
+    render_scene_demo(&render_cluster);
+
+    println!();
+    script_demo(&render_cluster);
+
+    println!();
+    gif_export_demo(&render_cluster);
+
+    println!();
+    orientation_demo(&render_cluster);
+
+    println!();
+    particles_demo(&render_cluster);
+
+    println!();
+    run_asset_demo();
+}
+
+/// Строит простого пони с фиксированным набором частей, сдвинутого по X —
+/// для сцены из нескольких персонажей рядом друг с другом.
+fn build_demo_character(name: &str, x_offset: f32) -> Character {
+    let mut character = Character::new(name);
+    let mut skeleton = default_pony_skeleton();
+    if let Some(root) = skeleton.bones.iter_mut().find(|b| b.id == "Root") {
+        root.local_transform.position.x = x_offset;
+    }
+    character.skeleton = skeleton;
+
+    character
+        .add_part(
+            Part::new("body", PartKind::Body, PartSource::Png { path: "assets/pony/body.png".into() })
+                .with_bone("Body")
+                .with_layer(0),
+        )
+        .add_part(
+            Part::new("head", PartKind::Head, PartSource::Png { path: "assets/pony/head.png".into() })
+                .with_bone("Head")
+                .with_layer(1),
+        )
+        .add_part(
+            Part::new("horn", PartKind::Horn, PartSource::Png { path: "assets/pony/horn.png".into() })
+                .with_bone("Horn")
+                .with_layer(2),
+        )
+        .add_part(
+            Part::new("ear_l", PartKind::Ear, PartSource::Png { path: "assets/pony/ear.png".into() })
+                .with_bone("EarL")
+                .with_layer(2),
+        )
+        .add_part(
+            Part::new("ear_r", PartKind::Ear, PartSource::Png { path: "assets/pony/ear.png".into() })
+                .with_bone("EarR")
+                .with_layer(2),
+        )
+        .add_part(
+            Part::new("eye_l", PartKind::Eyes, PartSource::Png { path: "assets/pony/eye.png".into() })
+                .with_bone("Head")
+                .with_layer(2),
+        )
+        .add_part(
+            Part::new("leg_fl", PartKind::LegFL, PartSource::Png { path: "assets/pony/leg.png".into() })
+                .with_bone("LowerLegFL")
+                .with_layer(0),
+        )
+        .add_part(
+            Part::new("leg_fr", PartKind::LegFR, PartSource::Png { path: "assets/pony/leg.png".into() })
+                .with_bone("LowerLegFR")
+                .with_layer(0),
+        )
+        // Эти три — SVG (растеризуются через resvg), остальные выше — PNG.
+        // Специально смешиваю оба источника на одном персонаже, чтобы
+        // проверить, что диспетчер в Renderer корректно разводит их по
+        // разным загрузчикам, а не только "какой-то один".
+        .add_part(
+            Part::new("wing_l", PartKind::Wing, PartSource::Vector { path: "assets/pony_svg/wing.svg".into() })
+                .with_bone("Body")
+                .with_layer(0),
+        )
+        .add_part(
+            Part::new("tail", PartKind::Tail, PartSource::Vector { path: "assets/pony_svg/tail.svg".into() })
+                .with_bone("Body")
+                .with_layer(0),
+        )
+        .add_part(
+            Part::new("mouth", PartKind::Mouth, PartSource::Vector { path: "assets/pony_svg/mouth.svg".into() })
+                .with_bone("Head")
+                .with_layer(2),
+        );
+
+    character
+}
+
+/// Настоящий render pass: раскладываем персонажей сцены по GPU-контекстам
+/// через RenderCluster::pick() (взвешенный round-robin) и рендерим каждого
+/// в offscreen-текстуру. С одним GPU все job'ы естественно попадут на него
+/// же — это ожидаемо и проверяемо; с несколькими — пойдут пропорционально
+/// весам адаптеров.
+fn render_scene_demo(render_cluster: &RenderCluster) {
+    println!("=== Рендер сцены через RenderCluster ===");
+    if render_cluster.is_cpu_only() {
+        println!("Кластер пуст (нет GPU-контекста) — рендер пропущен, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let characters = vec![
+        build_demo_character("Pony_A", -70.0),
+        build_demo_character("Pony_B", 0.0),
+        build_demo_character("Pony_C", 70.0),
+    ];
+
+    // Renderer привязан к конкретному GpuContext (свой pipeline + кэш
+    // текстур на своём device), поэтому держим по одному на контекст и
+    // переиспользуем; кэш текстур требует &mut при первой загрузке ассета.
+    let mut renderers: Vec<Renderer> = render_cluster.contexts.iter().map(Renderer::new).collect();
+
+    for (i, character) in characters.iter().enumerate() {
+        let ctx_idx = render_cluster
+            .contexts
+            .iter()
+            .position(|c| std::ptr::eq(c, render_cluster.pick(i).unwrap()))
+            .unwrap();
+        let ctx = &render_cluster.contexts[ctx_idx];
+        let renderer = &mut renderers[ctx_idx];
+
+        let frame = renderer.render_character(ctx, character, 320, 240, &pony_core::Camera::default(), 0.0);
+        let out_path = format!("scene_{}.ppm", character.name.to_lowercase());
+        save_ppm(&out_path, frame.width, frame.height, &frame.rgba);
+        println!(
+            "{}: отрисован на GPU '{}' -> {}",
+            character.name, frame.rendered_on, out_path
+        );
+    }
+}
+
+fn save_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) {
+    let mut file = std::fs::File::create(path).expect("failed to create ppm file");
+    write!(file, "P6\n{width} {height}\n255\n").unwrap();
+    for px in rgba.chunks_exact(4) {
+        file.write_all(&px[0..3]).unwrap(); // отбрасываем alpha, PPM его не поддерживает
+    }
+}
+
+/// Демонстрация скриптового слоя (раздел 15 ТЗ): скрипт на rhai описывает
+/// намерение через `pony.*`/`camera.*`, а `apply_commands` применяет
+/// получившиеся команды к реальному `Character`/`Camera`.
+fn script_demo(render_cluster: &RenderCluster) {
+    println!("=== Скриптовый слой (rhai) + проигрыватель анимаций ===");
+
+    let script = r#"
+        pony.Move(12.0, -3.0);
+        pony.Smile(0.8);
+        pony.Blink();
+        pony.Walk();
+        camera.Zoom(1.5);
+        camera.Shake(0.2);
+        camera.Move(0.0, 5.0);
+    "#;
+
+    let engine = ScriptEngine::new();
+    let commands = match engine.run(script) {
+        Ok(cmds) => cmds,
+        Err(err) => {
+            eprintln!("[pony-script] ошибка выполнения скрипта: {err}");
+            return;
+        }
+    };
+    println!("Скрипт испустил {} команд(ы)", commands.len());
+
+    let mut character = build_demo_character("ScriptedPony", 0.0);
+    // Даём персонажу реальную анимацию "Walk" — без неё pony.Walk() из
+    // скрипта был бы просто предупреждением в stderr (см. apply_commands).
+    // Голова покачивается по Y — тот же приём, что и Idle в run_asset_demo,
+    // только под другим именем и с бОльшей амплитудой, чтобы разница между
+    // кадрами была заметна и на глаз, и в цифрах.
+    character.add_animation(Animation {
+        name: "Walk".into(),
+        duration: 0.6,
+        looping: true,
+        tracks: vec![Track {
+            target: AnimTarget::Bone { id: "Head".into(), channel: BoneChannel::PositionY },
+            keyframes: vec![
+                Keyframe { time: 0.0, value: AnimValue::Float(0.0), interpolation: Interpolation::Linear },
+                Keyframe { time: 0.3, value: AnimValue::Float(-6.0), interpolation: Interpolation::Linear },
+                Keyframe { time: 0.6, value: AnimValue::Float(0.0), interpolation: Interpolation::Linear },
+            ],
+        }],
+    });
+
+    let mut camera = Camera::default();
+    let mut player = pony_core::AnimationPlayer::new();
+    pony_script::apply_commands(&mut character, &mut camera, &mut player, &commands);
+
+    let root_pos = character.skeleton.find("Root").unwrap().local_transform.position;
+    println!(
+        "После скрипта: позиция персонажа = {:?}, Smile = {:.2}, Blink = {:.2}",
+        root_pos,
+        character.default_morph.get("Smile"),
+        character.default_morph.get("Blink"),
+    );
+    println!(
+        "Камера: позиция = {:?}, zoom = {:.2}, shake = {:.2}",
+        camera.position, camera.zoom, camera.shake_intensity
+    );
+
+    if !player.is_valid(&character) {
+        println!("pony.Walk() не запустил анимацию (не должно случиться — Walk только что добавлена)");
+        return;
+    }
+    println!("pony.Walk() запустил анимацию '{}', проигрываем 3 кадра:", player.current_name().unwrap());
+
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — покажу только числа (Head.y), без кадров.");
+    }
+    let mut renderer = render_cluster.contexts.first().map(Renderer::new);
+
+    for step in 0..3 {
+        player.advance(&character, 0.2); // 0.6с анимации / 0.2с шаг = 3 разных фазы
+        player.apply(&mut character);
+        let head_y = character.skeleton.find("Head").unwrap().local_transform.position.y;
+        print!("  t={:.2}: Head.y = {:.2}", player.time(), head_y);
+
+        if let (Some(renderer), Some(ctx)) = (renderer.as_mut(), render_cluster.contexts.first()) {
+            let frame = renderer.render_character(ctx, &character, 320, 240, &camera, player.time());
+            let path = format!("walk_frame_{step}.ppm");
+            save_ppm(&path, frame.width, frame.height, &frame.rgba);
+            print!(" -> {path}");
+        }
+        println!();
+    }
+}
+
+/// Экспорт в GIF (раздел 14 ТЗ). Рендерит полный цикл анимации "Walk" кадр
+/// за кадром (24 fps, вся длительность 0.8с зацикленной анимации) и
+/// кодирует результат в настоящий анимированный `.gif` через
+/// `pony_render::export_gif` — не заглушку, файл открывается любым
+/// просмотрщиком.
+fn gif_export_demo(render_cluster: &RenderCluster) {
+    println!("=== Экспорт в GIF (раздел 14 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — экспорт пропущен, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let mut character = build_demo_character("GifPony", 0.0);
+    character.add_animation(Animation {
+        name: "Walk".into(),
+        duration: 0.8,
+        looping: true,
+        tracks: vec![Track {
+            target: AnimTarget::Bone { id: "Head".into(), channel: BoneChannel::PositionY },
+            keyframes: vec![
+                Keyframe { time: 0.0, value: AnimValue::Float(0.0), interpolation: Interpolation::Linear },
+                Keyframe { time: 0.4, value: AnimValue::Float(-6.0), interpolation: Interpolation::Linear },
+                Keyframe { time: 0.8, value: AnimValue::Float(0.0), interpolation: Interpolation::Linear },
+            ],
+        }],
+    });
+
+    let mut player = pony_core::AnimationPlayer::new();
+    player.play("Walk");
+    let camera = Camera::default();
+
+    const FPS: f32 = 24.0;
+    let total_frames = (0.8 * FPS).round() as usize;
+    let dt = 1.0 / FPS;
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+
+    let mut frames = Vec::with_capacity(total_frames);
+    for _ in 0..total_frames {
+        player.apply(&mut character);
+        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, player.time());
+        frames.push(frame);
+        player.advance(&character, dt);
+    }
+
+    let out_path = "walk_cycle.gif";
+    // 100/FPS сотых долей секунды на кадр — единица измерения самого GIF.
+    let delay_cs = (100.0 / FPS).round() as u16;
+    match export_gif(out_path, &frames, delay_cs) {
+        Ok(()) => {
+            let size = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+            println!("Экспортировано {} кадров -> {out_path} ({size} байт)", frames.len());
+        }
+        Err(err) => println!("Ошибка экспорта GIF: {err}"),
+    }
+}
+
+/// Автоматический поворот (раздел 8 ТЗ): рендерит одного персонажа под
+/// тремя углами (анфас, 45°, 80° — почти профиль) и печатает ширину
+/// непрозрачного силуэта на каждом кадре — должна монотонно сжиматься
+/// (foreshortening), а не оставаться одинаковой (что означало бы, что
+/// поворот ничего не делает).
+fn orientation_demo(render_cluster: &RenderCluster) {
+    println!("=== Автоматический поворот, 2.5D (раздел 8 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+
+    for (i, yaw_deg) in [0.0f32, 45.0, 80.0].iter().enumerate() {
+        let mut character = build_demo_character("YawPony", 0.0);
+        character.facing_yaw = yaw_deg.to_radians();
+        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0);
+        let path = format!("yaw_{i}.ppm");
+        save_ppm(&path, frame.width, frame.height, &frame.rgba);
+
+        // Ширина непрозрачного силуэта — считаем по первому/последнему
+        // столбцу, отличающемуся от цвета неба в левом верхнем углу.
+        let sky = &frame.rgba[0..4];
+        let mut min_x = frame.width;
+        let mut max_x = 0u32;
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                let idx = ((y * frame.width + x) * 4) as usize;
+                let px = &frame.rgba[idx..idx + 4];
+                if px != sky {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+        let width = max_x.saturating_sub(min_x);
+        println!("yaw={yaw_deg:.0}°: ширина силуэта = {width}px -> {path}");
+    }
+}
+
+/// Частицы (раздел 13 ТЗ): эмиттер снега над сценой, симулируем 1.5с и
+/// рендерим 3 кадра, проверяя число живых частиц (должно расти, потом
+/// стабилизироваться/колебаться у равновесия рождение==смерть) и то, что
+/// они реально сдвигаются вниз кадр к кадру (не застывшая картинка).
+fn particles_demo(render_cluster: &RenderCluster) {
+    println!("=== Частицы, Snow (раздел 13 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+
+    let mut emitter = pony_core::ParticleEmitter::new(pony_core::ParticleKind::Snow, glam::Vec2::new(0.0, 80.0), 15.0);
+    emitter.lifetime = 2.0;
+    emitter.spread = 60.0;
+
+    for step in 0..3 {
+        emitter.update(0.5); // полсекунды симуляции между кадрами
+        let frame = renderer.render_particles(ctx, &emitter, 240, 180, &camera, 0.0);
+        let path = format!("snow_{step}.ppm");
+        save_ppm(&path, frame.width, frame.height, &frame.rgba);
+        println!(
+            "t={:.1}с: живых частиц = {} -> {path}",
+            (step + 1) as f32 * 0.5,
+            emitter.particles.len()
+        );
+    }
+}
+
+fn run_asset_demo() {
     let mut character = Character::new("SamplePony");
     character.skeleton = default_pony_skeleton();
 

@@ -1,0 +1,9 @@
+[package]
+name = "pony-script"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pony-core = { path = "../pony-core" }
+rhai = "1"
+thiserror.workspace = true

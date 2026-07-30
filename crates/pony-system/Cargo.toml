@@ -1,0 +1,14 @@
+[package]
+name = "pony-system"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sysinfo.workspace = true
+wgpu.workspace = true
+rayon.workspace = true
+# Pinned: newer indexmap releases require the edition2024 Cargo feature,
+# which this container's cargo (1.75) doesn't support. Pin transitively
+# to keep wgpu/naga's dependency tree resolvable on older toolchains.
+indexmap = "=2.2.6"
+rayon-core = "=1.12.1"

@@ -37,6 +37,13 @@ pub struct Character {
     pub animations: HashMap<String, Animation>,
     pub physics: PhysicsConfig,
     pub metadata: Metadata,
+    /// Автоматический поворот (раздел 8 ТЗ), радианы, 0 = анфас. См.
+    /// `orientation::apply_yaw_2_5d` — сама математика пересчёта живёт
+    /// не здесь (это данные персонажа, а не поведение рендера).
+    /// `#[serde(default)]` — старые `.asset`-файлы без этого поля не
+    /// перестанут загружаться, просто получат анфас по умолчанию.
+    #[serde(default)]
+    pub facing_yaw: f32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +67,7 @@ impl Character {
             animations: HashMap::new(),
             physics: PhysicsConfig::default(),
             metadata: Metadata::default(),
+            facing_yaw: 0.0,
         }
     }
 

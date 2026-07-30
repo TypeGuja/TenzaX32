@@ -5,3 +5,9 @@ edition.workspace = true
 
 [dependencies]
 pony-core = { path = "../pony-core" }
+pony-system = { path = "../pony-system" }
+pony-render = { path = "../pony-render" }
+pony-script = { path = "../pony-script" }
+pollster.workspace = true
+rayon.workspace = true
+glam.workspace = true
