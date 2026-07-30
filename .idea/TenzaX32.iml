@@ -4,6 +4,10 @@
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/crates/pony-cli/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pony-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pony-render/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pony-system/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pony-script/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pony-gui/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
