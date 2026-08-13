@@ -2,7 +2,7 @@ use pony_core::animation::{AnimTarget, AnimValue, Animation, BoneChannel, Interp
 use pony_core::part::{Part, PartKind, PartSource};
 use pony_core::skeleton::default_pony_skeleton;
 use pony_core::{Camera, Character};
-use pony_render::{export_gif, RenderCluster, Renderer};
+use pony_render::{export_gif, export_spritesheet, RenderCluster, Renderer};
 use pony_script::ScriptEngine;
 use pony_system::{GpuAssignment, SystemProfile, WorkloadPolicy};
 use std::io::Write;
@@ -109,6 +109,21 @@ fn main() {
 
     println!();
     particles_demo(&render_cluster);
+
+    println!();
+    lighting_demo(&render_cluster);
+
+    println!();
+    psd_import_demo(&render_cluster);
+
+    println!();
+    kra_import_demo(&render_cluster);
+
+    println!();
+    memory_budget_demo(&render_cluster);
+
+    println!();
+    look_demo(&render_cluster);
 
     println!();
     run_asset_demo();
@@ -220,7 +235,7 @@ fn render_scene_demo(render_cluster: &RenderCluster) {
         let ctx = &render_cluster.contexts[ctx_idx];
         let renderer = &mut renderers[ctx_idx];
 
-        let frame = renderer.render_character(ctx, character, 320, 240, &pony_core::Camera::default(), 0.0);
+        let frame = renderer.render_character(ctx, character, 320, 240, &pony_core::Camera::default(), 0.0, &pony_core::Lighting::default(), None);
         let out_path = format!("scene_{}.ppm", character.name.to_lowercase());
         save_ppm(&out_path, frame.width, frame.height, &frame.rgba);
         println!(
@@ -318,7 +333,7 @@ fn script_demo(render_cluster: &RenderCluster) {
         print!("  t={:.2}: Head.y = {:.2}", player.time(), head_y);
 
         if let (Some(renderer), Some(ctx)) = (renderer.as_mut(), render_cluster.contexts.first()) {
-            let frame = renderer.render_character(ctx, &character, 320, 240, &camera, player.time());
+            let frame = renderer.render_character(ctx, &character, 320, 240, &camera, player.time(), &pony_core::Lighting::default(), None);
             let path = format!("walk_frame_{step}.ppm");
             save_ppm(&path, frame.width, frame.height, &frame.rgba);
             print!(" -> {path}");
@@ -333,7 +348,7 @@ fn script_demo(render_cluster: &RenderCluster) {
 /// `pony_render::export_gif` — не заглушку, файл открывается любым
 /// просмотрщиком.
 fn gif_export_demo(render_cluster: &RenderCluster) {
-    println!("=== Экспорт в GIF (раздел 14 ТЗ) ===");
+    println!("=== Экспорт: GIF + спрайт-лист (раздел 14 ТЗ) ===");
     if render_cluster.is_cpu_only() {
         println!("Рендер-кластер пуст — экспорт пропущен, нужен CPU-фоллбек рендерер.");
         return;
@@ -368,20 +383,32 @@ fn gif_export_demo(render_cluster: &RenderCluster) {
     let mut frames = Vec::with_capacity(total_frames);
     for _ in 0..total_frames {
         player.apply(&mut character);
-        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, player.time());
+        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, player.time(), &pony_core::Lighting::default(), None);
         frames.push(frame);
         player.advance(&character, dt);
     }
 
-    let out_path = "walk_cycle.gif";
+    let gif_path = "walk_cycle.gif";
     // 100/FPS сотых долей секунды на кадр — единица измерения самого GIF.
     let delay_cs = (100.0 / FPS).round() as u16;
-    match export_gif(out_path, &frames, delay_cs) {
+    match export_gif(gif_path, &frames, delay_cs) {
         Ok(()) => {
-            let size = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
-            println!("Экспортировано {} кадров -> {out_path} ({size} байт)", frames.len());
+            let size = std::fs::metadata(gif_path).map(|m| m.len()).unwrap_or(0);
+            println!("Экспортировано {} кадров -> {gif_path} ({size} байт)", frames.len());
         }
         Err(err) => println!("Ошибка экспорта GIF: {err}"),
+    }
+
+    let sheet_path = "walk_cycle_sheet.png";
+    match export_spritesheet(sheet_path, &frames, 5) {
+        Ok(layout) => {
+            let size = std::fs::metadata(sheet_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "Спрайт-лист {}x{} кадров ({}x{} каждый) -> {sheet_path} ({size} байт)",
+                layout.columns, layout.rows, layout.frame_width, layout.frame_height
+            );
+        }
+        Err(err) => println!("Ошибка экспорта спрайт-листа: {err}"),
     }
 }
 
@@ -404,7 +431,7 @@ fn orientation_demo(render_cluster: &RenderCluster) {
     for (i, yaw_deg) in [0.0f32, 45.0, 80.0].iter().enumerate() {
         let mut character = build_demo_character("YawPony", 0.0);
         character.facing_yaw = yaw_deg.to_radians();
-        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0);
+        let frame = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
         let path = format!("yaw_{i}.ppm");
         save_ppm(&path, frame.width, frame.height, &frame.rgba);
 
@@ -458,6 +485,194 @@ fn particles_demo(render_cluster: &RenderCluster) {
             emitter.particles.len()
         );
     }
+}
+
+/// Освещение (раздел 12 ТЗ): рендерит одного персонажа дважды — с
+/// `Lighting::default()` (нейтральный свет, должен давать тот же результат,
+/// что и раньше, до появления этого модуля) и с настоящим цветным точечным
+/// светом рядом с телом — и печатает цвет пикселя в центре тела в обоих
+/// случаях, чтобы доказать: свет реально меняет итоговый цвет, а не просто
+/// существует как неиспользуемый параметр.
+fn lighting_demo(render_cluster: &RenderCluster) {
+    println!("=== Освещение: Ambient/Sun/Point (раздел 12 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+    let character = build_demo_character("LitPony", 0.0);
+
+    let center_color = |frame: &pony_render::FrameOutput| -> [u8; 4] {
+        let idx = (((frame.height / 2) * frame.width + frame.width / 2) * 4) as usize;
+        [frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2], frame.rgba[idx + 3]]
+    };
+
+    let neutral = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
+    println!("Нейтральный свет (Lighting::default): центр тела = {:?}", center_color(&neutral));
+
+    let warm_point_light = pony_core::Lighting {
+        ambient: pony_core::AmbientLight { color: [0.3, 0.3, 0.35], intensity: 1.0 },
+        sun: None,
+        points: vec![pony_core::PointLight { position: glam::Vec2::new(0.0, 0.0), color: [1.0, 0.5, 0.1], intensity: 1.5, radius: 120.0 }],
+    };
+    let lit = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0, &warm_point_light, None);
+    println!("Тёплый точечный свет у тела: центр тела = {:?}", center_color(&lit));
+
+    save_ppm("lit_neutral.ppm", neutral.width, neutral.height, &neutral.rgba);
+    save_ppm("lit_point.ppm", lit.width, lit.height, &lit.rgba);
+}
+
+/// Импорт PSD (раздел 16 ТЗ). Показывает оба пути: настоящий несжатый PSD
+/// грузится и рендерится нормально, а PSD с Zip-сжатым слоем (реальный
+/// баг крейта `psd` 0.3.5 — паникует внутри `Psd::from_bytes`, см.
+/// `TextureLoadError::PsdPanic`) не роняет процесс — `catch_unwind` ловит
+/// панику, часть просто рисуется цветной заглушкой, как и для любого
+/// другого нечитаемого ассета.
+fn psd_import_demo(render_cluster: &RenderCluster) {
+    println!("=== Импорт PSD (раздел 16 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+
+    for (label, path) in [
+        ("несжатый (валидный)", "assets/test_fixtures/valid_uncompressed.psd"),
+        ("Zip-слой (паникующий в psd-крейте)", "assets/test_fixtures/unsupported_zip_layer.psd"),
+    ] {
+        let mut character = Character::new("PsdPony");
+        character.skeleton = default_pony_skeleton();
+        character.add_part(
+            Part::new("body", PartKind::Body, PartSource::Psd { path: path.into(), layer: None }).with_bone("Body").with_layer(0),
+        );
+        let frame = renderer.render_character(ctx, &character, 120, 90, &camera, 0.0, &pony_core::Lighting::default(), None);
+        let idx = (((frame.height / 2) * frame.width + frame.width / 2) * 4) as usize;
+        println!("{label}: не упало, центр кадра = {:?}", &frame.rgba[idx..idx + 4]);
+    }
+}
+
+/// Импорт KRA (раздел 16 ТЗ) — формат Krita, по сути zip-архив. Три пути:
+/// сведённый `mergedimage.png` (обычный случай), конкретный слой по имени
+/// файла внутри архива, и архив без `mergedimage.png` вообще (проверка,
+/// что честная ошибка не роняет рендер — тот же принцип, что и у PSD).
+fn kra_import_demo(render_cluster: &RenderCluster) {
+    println!("=== Импорт KRA (раздел 16 ТЗ) ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+
+    for (label, path, layer_file) in [
+        ("сведённый mergedimage.png", "assets/test_fixtures/valid_mergedimage.kra", None),
+        ("конкретный именованный слой", "assets/test_fixtures/valid_with_named_layer.kra", Some("layers/body.png")),
+        ("архив без mergedimage.png (должен упасть на заглушку)", "assets/test_fixtures/missing_mergedimage.kra", None),
+    ] {
+        let mut character = Character::new("KraPony");
+        character.skeleton = default_pony_skeleton();
+        character.add_part(
+            Part::new("body", PartKind::Body, PartSource::Kra { path: path.into(), layer_file: layer_file.map(String::from) })
+                .with_bone("Body")
+                .with_layer(0),
+        );
+        let frame = renderer.render_character(ctx, &character, 120, 90, &camera, 0.0, &pony_core::Lighting::default(), None);
+        let idx = (((frame.height / 2) * frame.width + frame.width / 2) * 4) as usize;
+        println!("{label}: не упало, центр кадра = {:?}", &frame.rgba[idx..idx + 4]);
+    }
+}
+
+/// Бюджет памяти на практике (`TextureCache` + `LruBudget`, см. README).
+/// Специально маленький бюджет (150КБ) — суммарный размер всех PNG-частей
+/// демо-персонажа (~286КБ) его не помещается, значит часть текстур
+/// обязательно вытеснится. Проверяем не по коду, а по факту: после рендера
+/// занятая память НЕ превышает бюджет (вытеснение реально сработало), а
+/// повторный рендер того же персонажа не падает (вытесненные текстуры
+/// прозрачно перезагружаются по новой).
+fn memory_budget_demo(render_cluster: &RenderCluster) {
+    println!("=== Бюджет памяти: LRU-вытеснение текстур ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    const SMALL_BUDGET_BYTES: u64 = 150_000;
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new_with_budget(ctx, SMALL_BUDGET_BYTES);
+    let camera = Camera::default();
+    let character = build_demo_character("BudgetPony", 0.0);
+
+    println!("Бюджет: {SMALL_BUDGET_BYTES} байт (суммарный размер всех PNG-частей персонажа ~286000 байт — не влезает целиком)");
+
+    let _ = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
+    println!(
+        "После 1-го рендера: занято {} из {} байт (в бюджете: {})",
+        renderer.texture_memory_used_bytes(),
+        renderer.texture_memory_budget_bytes(),
+        renderer.texture_memory_used_bytes() <= renderer.texture_memory_budget_bytes()
+    );
+
+    // Повторный рендер того же персонажа: часть текстур уже была вытеснена
+    // первым проходом (суммарный размер частей больше бюджета) — они
+    // должны прозрачно перезагрузиться, не уронив рендер.
+    let frame2 = renderer.render_character(ctx, &character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
+    println!(
+        "После 2-го рендера (часть текстур перезагружена после вытеснения): не упало, кадр {}x{}, занято {} байт",
+        frame2.width,
+        frame2.height,
+        renderer.texture_memory_used_bytes()
+    );
+}
+
+/// Доводка pony.Look() (раздел 7 ТЗ): рендерит персонажа с нейтральным
+/// взглядом и с `pony.Look()`, направленным резко вверх, и сравнивает
+/// пиксели области глаза — должны реально отличаться (глаз повернулся),
+/// а кость Head — не тронута (проверено отдельно unit-тестом в pony-script,
+/// здесь только визуальное подтверждение на реальном рендере).
+fn look_demo(render_cluster: &RenderCluster) {
+    println!("=== Доводка pony.Look(): взгляд через морфинг глаза, не поворот головы ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+    let script_engine = ScriptEngine::new();
+
+    let neutral_character = build_demo_character("LookPony", 0.0);
+    let neutral_frame = renderer.render_character(ctx, &neutral_character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
+
+    let mut looking_character = build_demo_character("LookPony", 0.0);
+    let mut dummy_camera = Camera::default();
+    let mut dummy_player = pony_core::AnimationPlayer::new();
+    let commands = script_engine.run("pony.Look(0.0, 1.0);").expect("script should run");
+    pony_script::apply_commands(&mut looking_character, &mut dummy_camera, &mut dummy_player, &commands);
+    println!(
+        "После pony.Look(0.0, 1.0): eyes.rotation = {:.3} рад (ожидаем π/2 ≈ 1.571), кость Head не тронута",
+        looking_character.default_morph.eyes.rotation
+    );
+    let looking_frame = renderer.render_character(ctx, &looking_character, 240, 180, &camera, 0.0, &pony_core::Lighting::default(), None);
+
+    let diff: u32 = neutral_frame
+        .rgba
+        .iter()
+        .zip(looking_frame.rgba.iter())
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+        .sum();
+    println!("Суммарная разница пикселей между нейтральным взглядом и Look(0,1): {diff} (0 означало бы, что Look ничего не меняет)");
+
+    save_ppm("look_neutral.ppm", neutral_frame.width, neutral_frame.height, &neutral_frame.rgba);
+    save_ppm("look_up.ppm", looking_frame.width, looking_frame.height, &looking_frame.rgba);
 }
 
 fn run_asset_demo() {

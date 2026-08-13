@@ -13,11 +13,13 @@
 
 use pony_system::{GpuAdapterInfo, GpuAssignment, SystemProfile};
 
+pub mod budget;
 pub mod export;
 pub mod renderer;
 pub mod texture;
-pub use export::{export_gif, GifExportError};
-pub use renderer::{FrameOutput, Renderer};
+pub use budget::LruBudget;
+pub use export::{export_gif, export_spritesheet, ExportError, SpriteSheetLayout};
+pub use renderer::{nominal_part_size, part_render_size, part_world_position, pivot_for_world_position, FrameOutput, Renderer, DEPTH_PER_LAYER};
 pub use texture::{LoadedTexture, TextureCache, TextureLoadError};
 
 #[derive(Debug, thiserror::Error)]

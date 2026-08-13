@@ -32,6 +32,14 @@ pub enum PartKind {
 pub enum PartSource {
     Png { path: String },
     Vector { path: String },
+    /// PSD (раздел 16 ТЗ). `layer` — имя конкретного слоя (`None` — взять
+    /// сведённое изображение всех видимых слоёв, `psd.rgba()`).
+    Psd { path: String, layer: Option<String> },
+    /// KRA (раздел 16 ТЗ, формат Krita — по сути zip-архив). `layer_file` —
+    /// имя конкретного PNG-файла внутри архива (обычно `layers/<имя>.png`),
+    /// `None` — взять сведённый превью-слой `mergedimage.png`, который
+    /// Krita всегда пишет в корень архива.
+    Kra { path: String, layer_file: Option<String> },
     /// Меш без текстуры — для случаев, где форма важнее заливки цветом.
     Mesh { path: String },
 }
@@ -41,8 +49,20 @@ pub struct Part {
     pub id: String,
     pub kind: PartKind,
     pub source: PartSource,
-    /// Точка вращения относительно локального центра изображения.
+    /// Смещение части относительно кости, к которой она прикреплена
+    /// (в единицах сцены; поворачивается и масштабируется вместе с костью).
+    ///
+    /// Раньше это поле существовало, но рендер его игнорировал — из-за чего
+    /// все части на одной кости рисовались ровно друг на друге и часть
+    /// нельзя было сдвинуть, не двигая кость вместе со всем остальным, что
+    /// к ней прикреплено. Теперь это настоящее смещение (см. `render_character`).
     pub pivot: Vec2,
+    /// Явный размер части на сцене. `None` — размер по умолчанию для её
+    /// `PartKind` (см. `nominal_part_size` в pony-render). Нужен, чтобы
+    /// нарисованная или импортированная часть отображалась того размера,
+    /// какого её сделали, а не подгонялась под жёсткую таблицу видов.
+    #[serde(default)]
+    pub size: Option<Vec2>,
     /// Порядок отрисовки (выше — поверх).
     pub layer: i32,
     /// К какой кости прикреплена часть.
@@ -56,6 +76,7 @@ impl Part {
             kind,
             source,
             pivot: Vec2::ZERO,
+            size: None,
             layer: 0,
             bone: None,
         }
@@ -68,6 +89,16 @@ impl Part {
 
     pub fn with_layer(mut self, layer: i32) -> Self {
         self.layer = layer;
+        self
+    }
+
+    pub fn with_pivot(mut self, pivot: Vec2) -> Self {
+        self.pivot = pivot;
+        self
+    }
+
+    pub fn with_size(mut self, size: Vec2) -> Self {
+        self.size = Some(size);
         self
     }
 }

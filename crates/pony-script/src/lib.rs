@@ -28,9 +28,12 @@ pub fn apply_commands(character: &mut Character, camera: &mut Camera, player: &m
                 }
             }
             Command::Look { x, y } => {
-                if let Some(head) = character.skeleton.bones.iter_mut().find(|b| b.id == "Head") {
-                    head.local_transform.rotation = y.atan2(*x);
-                }
+                // Доводка (было: крутили всю кость Head — грубое упрощение).
+                // По ТЗ (раздел 7) "взгляд" — это параметр глаза через
+                // морфинг (EyeParams.rotation), не поворот всей головы;
+                // сам поворот читает Renderer только для частей вида Eyes
+                // (см. render_character в pony-render).
+                character.default_morph.eyes.rotation = y.atan2(*x);
             }
             Command::Blink => character.default_morph.set("Blink", 1.0),
             Command::Smile { amount } => character.default_morph.set("Smile", *amount),
@@ -60,6 +63,28 @@ mod tests {
         let mut c = Character::new("ScriptTestPony");
         c.skeleton = default_pony_skeleton();
         c
+    }
+
+    #[test]
+    fn look_sets_eye_morph_rotation_not_head_bone() {
+        // Доводка pony.Look(): раньше крутила всю кость Head (грубое
+        // упрощение), теперь — параметр глаза через морфинг.
+        let engine = ScriptEngine::new();
+        let commands = engine.run("pony.Look(0.0, 1.0);").unwrap(); // прямо вверх
+
+        let mut character = test_character();
+        let head_rotation_before = character.skeleton.find("Head").unwrap().local_transform.rotation;
+
+        let mut camera = Camera::default();
+        let mut player = AnimationPlayer::new();
+        apply_commands(&mut character, &mut camera, &mut player, &commands);
+
+        let head_rotation_after = character.skeleton.find("Head").unwrap().local_transform.rotation;
+        assert_eq!(head_rotation_after, head_rotation_before, "Look не должен трогать кость головы");
+
+        // atan2(1.0, 0.0) = π/2 — "смотрит прямо вверх".
+        let expected = 1.0f32.atan2(0.0);
+        assert!((character.default_morph.eyes.rotation - expected).abs() < 1e-5);
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub enum AnimTarget {
     Camera { channel: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BoneChannel {
     PositionX,
     PositionY,

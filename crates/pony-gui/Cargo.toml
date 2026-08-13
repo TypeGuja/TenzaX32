@@ -10,6 +10,7 @@ pony-script = { path = "../pony-script" }
 pony-system = { path = "../pony-system" }
 wgpu.workspace = true
 pollster.workspace = true
+glam.workspace = true
 
 # Собраны напрямую (без `eframe`), чтобы не тащить принудительную
 # wayland/smithay-clipboard зависимость eframe (см. README, раздел про
