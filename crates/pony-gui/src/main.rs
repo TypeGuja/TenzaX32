@@ -38,8 +38,15 @@ use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::window::WindowBuilder;
 
-const SCENE_WIDTH: u32 = 480;
-const SCENE_HEIGHT: u32 = 360;
+// Раньше 480x360 — при обычном использовании (Stage не на весь экран,
+// зум > 100% для точной работы с мелкими частями/узлами) разрешение
+// быстро становилось заметно "пиксельным". Увеличено вдвое — вместе с
+// MSAA (см. pony-render) и LINEAR-фильтрацией (см. ниже) даёт заметно
+// более гладкую картинку. Цена — вдвое больше пикселей на GPU-рендер и
+// CPU-readback каждый кадр; для сцены с квадами частей персонажа (не
+// сложная 3D-геометрия) это остаётся дешёвым.
+const SCENE_WIDTH: u32 = 960;
+const SCENE_HEIGHT: u32 = 720;
 const FPS: f32 = 24.0;
 const ASSET_PATH: &str = "gui_character.asset";
 
@@ -136,6 +143,7 @@ enum RightTab {
     Lighting,
     Particles,
     Bones,
+    SvgInspector,
 }
 
 impl RightTab {
@@ -151,14 +159,29 @@ impl RightTab {
             RightTab::Lighting => "Lighting",
             RightTab::Particles => "Particles",
             RightTab::Bones => "Bones",
+            RightTab::SvgInspector => "SVG",
         }
     }
 }
 
 /// Timeline как в Animate: слои встроены прямо в панель (левая колонка —
-/// имя + видимость + блокировка), справа — сетка КАДРОВ (не времени),
+/// имя + видимость + блокировка, ЗАФИКСИРОВАНА и не скроллится по
+/// горизонтали), справа — прокручиваемая сетка КАДРОВ (не времени),
 /// ключевые кадры — кружки в ячейках, плейхед. Один слой может не иметь
 /// собственной дорожки анимации (нормально, как в Animate — статичные слои).
+///
+/// Реально рабочие взаимодействия с сеткой (не только просмотр):
+/// - Zoom — слайдер вверху, кадры становятся достаточно широкими, чтобы по
+///   ним было реально попасть мышью (раньше при длинной анимации ширина
+///   кадра падала до нескольких пикселей — отсюда и жалоба "работать с
+///   таймлайном нереально").
+/// - Клик по ПУСТОЙ клетке в строке слоя — новый ключевой кадр там (текущая
+///   Y-позиция кости слоя на момент клика).
+/// - Клик по СУЩЕСТВУЮЩЕМУ ключу — выбрать его (подсвечивается ярче).
+/// - Перетаскивание выбранного ключа — двигает его по времени, значение
+///   сохраняется (не сбрасывается на текущую позицию кости).
+/// - Delete/Backspace с выбранным ключом — удаляет его.
+/// - Перетаскивание/клик НЕ по ключу — как и раньше, скрабит плейхед.
 #[allow(clippy::too_many_arguments)]
 fn timeline_widget(
     ui: &mut egui::Ui,
@@ -168,9 +191,12 @@ fn timeline_widget(
     hidden: &mut HashSet<String>,
     locked: &mut HashSet<String>,
     selected: &mut Option<String>,
+    timeline_zoom: &mut f32,
+    selected_keyframe: &mut Option<(String, i64)>,
+    timeline_channel: &mut BoneChannel,
 ) {
-    let anim_data: Option<(f32, Vec<Track>)> =
-        player.current_name().and_then(|n| character.animations.get(n)).map(|a| (a.duration, a.tracks.clone()));
+    let anim_name = player.current_name().map(str_to_owned);
+    let anim_data: Option<(f32, Vec<Track>)> = anim_name.as_deref().and_then(|n| character.animations.get(n)).map(|a| (a.duration, a.tracks.clone()));
     let (duration, tracks) = anim_data.unwrap_or((1.0, Vec::new()));
     let duration = duration.max(0.01);
     let total_frames = (duration * FPS).round().max(1.0) as i64;
@@ -182,19 +208,44 @@ fn timeline_widget(
     // кость этого слоя. Дорожки без такой привязки (Morph/EyeParam/Camera)
     // собираются в один дополнительный ряд "Прочее" внизу — в реальном
     // Animate у морфинга/камеры тоже нет отдельного "слоя" на канвасе.
+    //
+    // Важно: НЕСКОЛЬКО частей могут ссылаться на ОДНУ и ту же кость (в
+    // демо-персонаже так и есть — "tail" и "body" обе висят на кости
+    // "Body"). Дорожка анимации привязана к кости, не к части — значит
+    // один и тот же ключевой кадр по смыслу относится сразу ко ВСЕМ таким
+    // частям. Раньше он показывался только в строке ПЕРВОЙ подходящей
+    // части — из-за чего клик по пустой клетке в строке "tail" реально
+    // создавал ключ (для кости Body, всё верно), но точка появлялась в
+    // строке "body", а не "tail" — выглядело как "клик попал не туда",
+    // хотя данные были правильными с самого начала. Теперь дорожка
+    // отображается на ВСЕХ строках, чьи части используют эту кость — это
+    // и есть правда о том, что реально анимируется.
+    //
+    // Показываем ТОЛЬКО дорожки выбранного канала (PositionX/Y, Rotation,
+    // ScaleX/Y — выбирается селектором выше сетки). Раньше канал был жёстко
+    // зашит на PositionY — анимировать поворот или горизонтальное движение
+    // было вообще нельзя было через таймлайн. Дорожки НЕ-костей (морфинг,
+    // камера) канала не имеют — остаются в "Прочее" независимо от выбора.
     let mut layer_frames: Vec<(String, Vec<i64>)> = layer_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     let mut misc_frames: Vec<i64> = Vec::new();
     for track in &tracks {
         let bone_id = match &track.target {
-            AnimTarget::Bone { id, .. } => Some(id.as_str()),
+            AnimTarget::Bone { id, channel } if *channel == *timeline_channel => Some(id.as_str()),
+            AnimTarget::Bone { .. } => continue, // другой канал той же кости — не в этом виде
             _ => None,
         };
-        let matched_layer = bone_id.and_then(|bid| layer_ids.iter().find(|lid| character.parts[*lid].bone.as_deref() == Some(bid)));
         let frames: Vec<i64> = track.keyframes.iter().map(|kf| (kf.time * FPS).round() as i64).collect();
-        match matched_layer {
-            Some(lid) => {
-                if let Some(entry) = layer_frames.iter_mut().find(|(id, _)| id == lid) {
-                    entry.1.extend(frames);
+        match bone_id {
+            Some(bid) => {
+                let mut any_matched = false;
+                for (lid, entry_frames) in layer_frames.iter_mut() {
+                    if character.parts[lid].bone.as_deref() == Some(bid) {
+                        entry_frames.extend(frames.iter().copied());
+                        any_matched = true;
+                    }
+                }
+                if !any_matched {
+                    misc_frames.extend(frames);
                 }
             }
             None => misc_frames.extend(frames),
@@ -208,23 +259,6 @@ fn timeline_widget(
     let row_count = layer_ids.len() + if has_misc { 1 } else { 0 };
     let total_height = ruler_height + row_height * row_count.max(1) as f32;
 
-    let desired_size = egui::vec2(ui.available_width(), total_height);
-    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(20));
-
-    let grid_rect = egui::Rect::from_min_max(egui::pos2(rect.left() + label_col_width, rect.top()), rect.max);
-    let ruler_rect = egui::Rect::from_min_max(grid_rect.min, egui::pos2(grid_rect.right(), grid_rect.top() + ruler_height));
-    painter.rect_filled(ruler_rect, 0.0, egui::Color32::from_gray(32));
-
-    let frame_w = (grid_rect.width() / total_frames as f32).max(2.0);
-    let tick_every = if total_frames <= 30 { 1 } else { (total_frames / 20).max(1) };
-    for f in (0..=total_frames).step_by(tick_every as usize) {
-        let x = grid_rect.left() + f as f32 * frame_w;
-        painter.line_segment([egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
-        painter.text(egui::pos2(x + 2.0, ruler_rect.top() + 1.0), egui::Align2::LEFT_TOP, format!("{f}"), egui::FontId::proportional(9.0), egui::Color32::from_gray(160));
-    }
-
     let mut row_labels: Vec<(String, Option<Vec<i64>>)> = layer_ids
         .iter()
         .zip(layer_frames.into_iter().map(|(_, frames)| frames))
@@ -234,70 +268,77 @@ fn timeline_widget(
         row_labels.push(("(Прочее: камера/морфы)".to_string(), None));
     }
 
-    for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
-        let row_top = grid_rect.top() + ruler_height + row_height * i as f32;
-        let label_row_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), row_top), egui::pos2(grid_rect.left(), row_top + row_height));
-        let grid_row_rect = egui::Rect::from_min_max(egui::pos2(grid_rect.left(), row_top), egui::pos2(grid_rect.right(), row_top + row_height));
-        let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
-        painter.rect_filled(label_row_rect, 0.0, bg);
-        painter.rect_filled(grid_row_rect, 0.0, bg);
+    ui.horizontal(|ui| {
+        ui.label("Zoom:");
+        ui.add(egui::Slider::new(timeline_zoom, 0.25..=6.0).fixed_decimals(2));
+        ui.separator();
+        ui.label("Канал:");
+        egui::ComboBox::from_id_source("timeline_channel").selected_text(channel_label(*timeline_channel)).show_ui(ui, |ui| {
+            for ch in [BoneChannel::PositionX, BoneChannel::PositionY, BoneChannel::Rotation, BoneChannel::ScaleX, BoneChannel::ScaleY] {
+                ui.selectable_value(timeline_channel, ch, channel_label(ch));
+            }
+        });
+        ui.separator();
+        ui.small("клик по пустой клетке — новый ключ · тащить кружок — сдвинуть по времени · Delete — удалить выбранный");
+    });
 
-        let is_layer_row = frames_opt.is_some();
-        if is_layer_row {
-            let is_selected = selected.as_deref() == Some(label.as_str());
-            if is_selected {
-                painter.rect_filled(label_row_rect, 0.0, egui::Color32::from_rgb(45, 65, 90));
+    let base_frame_w = 8.0;
+    let frame_w = (base_frame_w * *timeline_zoom).max(1.5);
+    let delete_pressed = ui.ctx().input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+
+    ui.horizontal_top(|ui| {
+        // --- Фиксированная колонка меток слоёв: не в ScrollArea, поэтому
+        // остаётся на месте при горизонтальной прокрутке сетки кадров. ---
+        let (label_rect, label_response) = ui.allocate_exact_size(egui::vec2(label_col_width, total_height), egui::Sense::click());
+        let lp = ui.painter_at(label_rect);
+        lp.rect_filled(label_rect, 0.0, egui::Color32::from_gray(20));
+        for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
+            let row_top = label_rect.top() + ruler_height + row_height * i as f32;
+            let row_rect = egui::Rect::from_min_max(egui::pos2(label_rect.left(), row_top), egui::pos2(label_rect.right(), row_top + row_height));
+            let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
+            lp.rect_filled(row_rect, 0.0, bg);
+
+            let is_layer_row = frames_opt.is_some();
+            if is_layer_row {
+                if selected.as_deref() == Some(label.as_str()) {
+                    lp.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(45, 65, 90));
+                }
+                let cb_rect = egui::Rect::from_min_size(egui::pos2(label_rect.left() + 4.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
+                let visible = !hidden.contains(label);
+                lp.rect_stroke(cb_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+                if visible {
+                    lp.rect_filled(cb_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(120, 170, 230));
+                }
+                let lock_rect = egui::Rect::from_min_size(egui::pos2(label_rect.left() + 20.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
+                let is_locked = locked.contains(label);
+                lp.rect_stroke(lock_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+                if is_locked {
+                    lp.rect_filled(lock_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(230, 170, 90));
+                }
+                lp.text(
+                    egui::pos2(label_rect.left() + 38.0, row_top + row_height / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(210),
+                );
+            } else {
+                lp.text(
+                    egui::pos2(label_rect.left() + 6.0, row_top + row_height / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(150),
+                );
             }
-            let cb_rect = egui::Rect::from_min_size(egui::pos2(rect.left() + 4.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
-            let visible = !hidden.contains(label);
-            painter.rect_stroke(cb_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
-            if visible {
-                painter.rect_filled(cb_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(120, 170, 230));
-            }
-            let lock_rect = egui::Rect::from_min_size(egui::pos2(rect.left() + 20.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
-            let is_locked = locked.contains(label);
-            painter.rect_stroke(lock_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
-            if is_locked {
-                painter.rect_filled(lock_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(230, 170, 90));
-            }
-            painter.text(
-                egui::pos2(rect.left() + 38.0, row_top + row_height / 2.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(210),
-            );
-        } else {
-            painter.text(
-                egui::pos2(rect.left() + 6.0, row_top + row_height / 2.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
         }
-
-        let frames: &[i64] = frames_opt.as_deref().unwrap_or(&misc_frames);
-        for &f in frames {
-            let x = grid_rect.left() + f as f32 * frame_w + frame_w / 2.0;
-            let cy = row_top + row_height / 2.0;
-            painter.circle_filled(egui::pos2(x, cy), 4.0, egui::Color32::from_rgb(230, 190, 90));
-            painter.circle_stroke(egui::pos2(x, cy), 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 90, 30)));
-        }
-    }
-
-    let current_frame = (player.time() * FPS).round().clamp(0.0, total_frames as f32);
-    let playhead_x = grid_rect.left() + current_frame * frame_w;
-    painter.line_segment([egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())], egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 80, 80)));
-
-    if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if pos.x < grid_rect.left() {
-                let row_i = ((pos.y - (grid_rect.top() + ruler_height)) / row_height).floor() as i64;
+        if label_response.clicked() {
+            if let Some(pos) = label_response.interact_pointer_pos() {
+                let row_i = ((pos.y - (label_rect.top() + ruler_height)) / row_height).floor() as i64;
                 if row_i >= 0 && (row_i as usize) < row_labels.len() {
                     let (label, frames_opt) = &row_labels[row_i as usize];
                     if frames_opt.is_some() {
-                        let local_x = pos.x - rect.left();
+                        let local_x = pos.x - label_rect.left();
                         if (4.0..16.0).contains(&local_x) {
                             if hidden.contains(label) {
                                 hidden.remove(label);
@@ -317,19 +358,184 @@ fn timeline_widget(
                 }
             }
         }
-    }
-    if response.dragged() || (response.clicked() && response.interact_pointer_pos().map(|p| p.x >= grid_rect.left()).unwrap_or(false)) {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if pos.x >= grid_rect.left() {
-                let frac = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                let target_t = frac * duration;
-                *playing = false;
-                let current = player.time();
-                player.advance(character, target_t - current);
-                player.apply(character);
+
+        // --- Прокручиваемая сетка кадров ---
+        egui::ScrollArea::horizontal().id_source("timeline_grid_scroll").auto_shrink([false, true]).show(ui, |ui| {
+            let grid_width = (total_frames as f32 * frame_w).max(ui.available_width());
+            let (grid_rect, grid_response) = ui.allocate_exact_size(egui::vec2(grid_width, total_height), egui::Sense::click_and_drag());
+            let gp = ui.painter_at(grid_rect);
+            gp.rect_filled(grid_rect, 0.0, egui::Color32::from_gray(20));
+
+            let ruler_rect = egui::Rect::from_min_max(grid_rect.min, egui::pos2(grid_rect.right(), grid_rect.top() + ruler_height));
+            gp.rect_filled(ruler_rect, 0.0, egui::Color32::from_gray(32));
+            let tick_every = if frame_w >= 14.0 { 1 } else { (14.0 / frame_w).ceil() as i64 }.max(1);
+            for f in (0..=total_frames).step_by(tick_every as usize) {
+                let x = grid_rect.left() + f as f32 * frame_w;
+                gp.line_segment([egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
+                gp.text(egui::pos2(x + 2.0, ruler_rect.top() + 1.0), egui::Align2::LEFT_TOP, format!("{f}"), egui::FontId::proportional(9.0), egui::Color32::from_gray(160));
             }
-        }
-    }
+
+            for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
+                let row_top = grid_rect.top() + ruler_height + row_height * i as f32;
+                let row_rect = egui::Rect::from_min_max(egui::pos2(grid_rect.left(), row_top), egui::pos2(grid_rect.right(), row_top + row_height));
+                let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
+                gp.rect_filled(row_rect, 0.0, bg);
+
+                // Тонкая сетка кадров — видно, куда именно кликаешь, когда
+                // приближен зумом.
+                if frame_w >= 4.0 {
+                    for f in 0..=total_frames {
+                        let x = grid_rect.left() + f as f32 * frame_w;
+                        gp.line_segment([egui::pos2(x, row_top), egui::pos2(x, row_top + row_height)], egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+                    }
+                }
+
+                let frames: &[i64] = frames_opt.as_deref().unwrap_or(&misc_frames);
+                for &f in frames {
+                    let x = grid_rect.left() + f as f32 * frame_w + frame_w / 2.0;
+                    let cy = row_top + row_height / 2.0;
+                    let is_sel = selected_keyframe.as_ref().map(|(l, ff)| l == label && *ff == f).unwrap_or(false);
+                    let r = if is_sel { 5.5 } else { 4.0 };
+                    let col = if is_sel { egui::Color32::from_rgb(255, 230, 140) } else { egui::Color32::from_rgb(230, 190, 90) };
+                    gp.circle_filled(egui::pos2(x, cy), r, col);
+                    gp.circle_stroke(egui::pos2(x, cy), r, egui::Stroke::new(if is_sel { 2.0 } else { 1.0 }, egui::Color32::from_rgb(120, 90, 30)));
+                }
+            }
+
+            let current_frame = (player.time() * FPS).round().clamp(0.0, total_frames as f32);
+            let playhead_x = grid_rect.left() + current_frame * frame_w;
+            gp.line_segment([egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())], egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 80, 80)));
+
+            // Ищет ключ (строка, номер кадра) под точкой, если он там есть —
+            // общая логика для выбора и для решения "драг — это скраб или
+            // перетаскивание ключа".
+            let keyframe_at = |pos: egui::Pos2| -> Option<(String, i64)> {
+                for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
+                    let frames = frames_opt.as_deref()?;
+                    let row_top = grid_rect.top() + ruler_height + row_height * i as f32;
+                    let cy = row_top + row_height / 2.0;
+                    if (pos.y - cy).abs() > row_height / 2.0 {
+                        continue;
+                    }
+                    for &f in frames {
+                        let x = grid_rect.left() + f as f32 * frame_w + frame_w / 2.0;
+                        // Раньше радиус попадания был (frame_w/2).max(4).min(9) —
+                        // при обычном зуме (frame_w=8) это ровно 4px, и
+                        // перетаскивание ключа промахивалось мимо самого себя
+                        // при малейшей неточности клика (воспроизведено: клик
+                        // в 2px от центра точки уже не засчитывался). Кружок
+                        // рисуется радиусом 4-5.5px — hit-радиус должен быть
+                        // заметно ЩЕДРЕЕ видимого кружка, не around him.
+                        if (pos.x - x).abs() < (frame_w / 2.0).max(7.0).min(14.0) {
+                            return Some((label.clone(), f));
+                        }
+                    }
+                }
+                None
+            };
+
+            if grid_response.drag_started() {
+                // Важно: НЕ `grid_response.interact_pointer_pos()` — она
+                // может вернуть точку уже ПОСЛЕ того, как курсор отъехал от
+                // места нажатия (egui распознаёт "это драг" только после
+                // превышения порога сдвига, и к этому моменту сообщаемая
+                // позиция уже смещена от настоящего mousedown — при крупных
+                // скачках между событиями мыши, как в этой тестовой
+                // Xvfb-среде, разница доходила до 90px, и попытка
+                // перетащить ключ промахивалась мимо самого себя). Берём
+                // `press_origin()` — она хранит ИСХОДНУЮ точку нажатия на
+                // весь жест, независимо от того, где курсор оказался, когда
+                // сам факт "это драг" был распознан.
+                let pos = ui.input(|i| i.pointer.press_origin());
+                *selected_keyframe = pos.and_then(keyframe_at);
+            }
+
+            if grid_response.dragged() {
+                if let (Some((label, orig_frame)), Some(pos)) = (selected_keyframe.clone(), grid_response.interact_pointer_pos()) {
+                    // Тащим существующий ключ по времени — значение
+                    // сохраняем (не сбрасываем на текущую позицию кости).
+                    let new_frame = (((pos.x - grid_rect.left()) / frame_w).round() as i64).clamp(0, total_frames);
+                    if new_frame != orig_frame {
+                        if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
+                            if let Some(name) = &anim_name {
+                                if let Some(anim) = character.animations.get_mut(name) {
+                                    let old_t = orig_frame as f32 / FPS;
+                                    let new_t = new_frame as f32 / FPS;
+                                    if let Some(value) = remove_keyframe(anim, &bone_id, *timeline_channel, old_t) {
+                                        insert_keyframe(anim, &bone_id, *timeline_channel, new_t, value);
+                                        *selected_keyframe = Some((label, new_frame));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(pos) = grid_response.interact_pointer_pos() {
+                    // Не над ключом — как и раньше, перетаскивание скрабит
+                    // плейхед.
+                    if pos.x >= grid_rect.left() {
+                        let frac = ((pos.x - grid_rect.left()) / (total_frames as f32 * frame_w)).clamp(0.0, 1.0);
+                        let target_t = frac * duration;
+                        *playing = false;
+                        let current = player.time();
+                        player.advance(character, target_t - current);
+                        player.apply(character);
+                    }
+                }
+            } else if grid_response.clicked() {
+                if let Some(pos) = grid_response.interact_pointer_pos() {
+                    match keyframe_at(pos) {
+                        Some(hit) => *selected_keyframe = Some(hit),
+                        None => {
+                            let row_i = ((pos.y - (grid_rect.top() + ruler_height)) / row_height).floor() as i64;
+                            let in_layer_row = row_i >= 0 && (row_i as usize) < row_labels.len() && row_labels[row_i as usize].1.is_some();
+                            if in_layer_row && pos.y >= grid_rect.top() + ruler_height {
+                                // Пустая клетка в строке слоя — новый ключ
+                                // с текущим значением ВЫБРАННОГО канала
+                                // (Position X/Y, Rotation, Scale X/Y — см.
+                                // селектор "Канал" выше сетки) этой кости.
+                                let (label, _) = &row_labels[row_i as usize];
+                                let label = label.clone();
+                                if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
+                                    let frame = (((pos.x - grid_rect.left()) / frame_w).round() as i64).clamp(0, total_frames);
+                                    let t = frame as f32 / FPS;
+                                    let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, *timeline_channel)).unwrap_or(0.0);
+                                    if let Some(name) = &anim_name {
+                                        if let Some(anim) = character.animations.get_mut(name) {
+                                            insert_keyframe(anim, &bone_id, *timeline_channel, t, value);
+                                            *selected_keyframe = Some((label, frame));
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Ruler или строка "Прочее" — скраб.
+                                if pos.x >= grid_rect.left() {
+                                    let frac = ((pos.x - grid_rect.left()) / (total_frames as f32 * frame_w)).clamp(0.0, 1.0);
+                                    *playing = false;
+                                    let current = player.time();
+                                    player.advance(character, frac * duration - current);
+                                    player.apply(character);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if delete_pressed {
+                if let Some((label, frame)) = selected_keyframe.clone() {
+                    if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
+                        if let Some(name) = &anim_name {
+                            if let Some(anim) = character.animations.get_mut(name) {
+                                if remove_keyframe(anim, &bone_id, *timeline_channel, frame as f32 / FPS).is_some() {
+                                    *selected_keyframe = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
 
 fn color32_to_rgb(c: egui::Color32) -> [f32; 3] {
@@ -364,16 +570,13 @@ fn selected_bone_id(character: &pony_core::Character, selected: &Option<String>)
 /// в момент `time`. Если дорожки на эту кость ещё нет — создаём её.
 /// Ключ ровно на том же времени заменяется, а не дублируется — иначе
 /// сэмплирование зависело бы от порядка вставки.
-fn insert_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, time: f32, value: f32) {
-    let target_matches = |t: &AnimTarget| matches!(t, AnimTarget::Bone { id, channel } if id == bone_id && *channel == BoneChannel::PositionY);
+fn insert_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, channel: BoneChannel, time: f32, value: f32) {
+    let target_matches = |t: &AnimTarget| matches!(t, AnimTarget::Bone { id, channel: c } if id == bone_id && *c == channel);
 
     let track = match anim.tracks.iter_mut().find(|t| target_matches(&t.target)) {
         Some(t) => t,
         None => {
-            anim.tracks.push(Track {
-                target: AnimTarget::Bone { id: bone_id.to_string(), channel: BoneChannel::PositionY },
-                keyframes: Vec::new(),
-            });
+            anim.tracks.push(Track { target: AnimTarget::Bone { id: bone_id.to_string(), channel }, keyframes: Vec::new() });
             anim.tracks.last_mut().expect("just pushed")
         }
     };
@@ -390,6 +593,161 @@ fn insert_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, ti
     }
     if time > anim.duration {
         anim.duration = time;
+    }
+}
+
+/// Убрать ключевой кадр (для перетаскивания по времени — старый убираем,
+/// новый ставим через `insert_keyframe`, значение сохраняем, а не
+/// сбрасываем к текущей позиции кости) — возвращает значение убранного
+/// ключа, `None`, если дорожки/ключа с таким временем не нашлось.
+fn remove_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, channel: BoneChannel, time: f32) -> Option<f32> {
+    let target_matches = |t: &AnimTarget| matches!(t, AnimTarget::Bone { id, channel: c } if id == bone_id && *c == channel);
+    let track = anim.tracks.iter_mut().find(|t| target_matches(&t.target))?;
+    let idx = track.keyframes.iter().position(|k| (k.time - time).abs() < 1e-3)?;
+    let kf = track.keyframes.remove(idx);
+    match kf.value {
+        AnimValue::Float(v) => Some(v),
+        _ => Some(0.0),
+    }
+}
+
+/// Текущее значение выбранного канала кости — им затравливается новый
+/// ключевой кадр (клик по пустой клетке ставит "как сейчас", не 0).
+fn bone_channel_value(bone: &pony_core::skeleton::Bone, channel: BoneChannel) -> f32 {
+    match channel {
+        BoneChannel::PositionX => bone.local_transform.position.x,
+        BoneChannel::PositionY => bone.local_transform.position.y,
+        BoneChannel::Rotation => bone.local_transform.rotation,
+        BoneChannel::ScaleX => bone.local_transform.scale.x,
+        BoneChannel::ScaleY => bone.local_transform.scale.y,
+    }
+}
+
+/// Раздел 33 ТЗ — таймлайн как линия с делениями и точками-ключами:
+/// ```text
+/// 0       12       24       36
+/// │--------│--------│--------│
+/// ●                 ●
+/// ```
+/// Используется в обзорном режиме "Все": одна такая строка на персонажа
+/// сцены, вместо простого пункта списка — сразу видно длительность
+/// анимации, плотность ключей и где сейчас плейхед, не открывая полный
+/// таймлайн этого персонажа. Обзорная, не подробная: точки — по ВСЕМ
+/// дорожкам всех каналов сразу, без разбивки по слоям (для этого есть
+/// режим "Персонаж" — полный `timeline_widget`). Клик по строке
+/// (возвращённый `Response`) — сделать этого персонажа активным.
+fn character_timeline_strip(ui: &mut egui::Ui, character: &Character, player: &AnimationPlayer, is_active: bool) -> egui::Response {
+    let height = 30.0;
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+
+    let bg = if is_active {
+        egui::Color32::from_rgb(38, 52, 72)
+    } else if response.hovered() {
+        egui::Color32::from_gray(34)
+    } else {
+        egui::Color32::from_gray(26)
+    };
+    painter.rect_filled(rect, 3.0, bg);
+    if is_active {
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 140, 200)));
+    }
+
+    let anim = player.current_name().and_then(|n| character.animations.get(n));
+    let duration = anim.map(|a| a.duration).unwrap_or(1.0).max(0.01);
+    let total_frames = (duration * FPS).round().max(1.0) as i64;
+
+    let line_y = rect.bottom() - 9.0;
+    let line_left = rect.left() + 10.0;
+    let line_right = rect.right() - 10.0;
+    let span = (line_right - line_left).max(1.0);
+
+    // Деления — 4 промежутка, как в примере из ТЗ (0/12/24/36 — там шаг
+    // подобран под конкретную длину; здесь считаем от реальной
+    // длительности, чтобы деления оставались осмысленными на любой
+    // анимации, а не только на демонстрационной из ТЗ).
+    painter.line_segment([egui::pos2(line_left, line_y), egui::pos2(line_right, line_y)], egui::Stroke::new(1.5, egui::Color32::from_gray(130)));
+    let tick_every = (total_frames / 4).max(1);
+    let mut f = 0;
+    while f <= total_frames {
+        let x = line_left + (f as f32 / total_frames as f32) * span;
+        painter.line_segment([egui::pos2(x, line_y - 3.0), egui::pos2(x, line_y + 3.0)], egui::Stroke::new(1.0, egui::Color32::from_gray(95)));
+        f += tick_every;
+    }
+
+    if let Some(anim) = anim {
+        for track in &anim.tracks {
+            for kf in &track.keyframes {
+                let frac = (kf.time / duration).clamp(0.0, 1.0);
+                let x = line_left + frac * span;
+                painter.circle_filled(egui::pos2(x, line_y), 3.0, egui::Color32::from_rgb(230, 190, 90));
+                painter.circle_stroke(egui::pos2(x, line_y), 3.0, egui::Stroke::new(0.8, egui::Color32::from_rgb(120, 90, 30)));
+            }
+        }
+    }
+
+    // Плейхед — текущее время воспроизведения этого персонажа (у каждого
+    // своё, независимое — см. own AnimationPlayer в CharacterSlot).
+    let play_frac = (player.time() / duration).clamp(0.0, 1.0);
+    let px = line_left + play_frac * span;
+    painter.line_segment([egui::pos2(px, rect.top() + 3.0), egui::pos2(px, line_y + 5.0)], egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 90, 90)));
+
+    response
+}
+
+fn channel_label(channel: BoneChannel) -> &'static str {
+    match channel {
+        BoneChannel::PositionX => "Position X",
+        BoneChannel::PositionY => "Position Y",
+        BoneChannel::Rotation => "Rotation",
+        BoneChannel::ScaleX => "Scale X",
+        BoneChannel::ScaleY => "Scale Y",
+    }
+}
+
+/// Открыть уже сохранённую SVG-часть на редактирование: читает файл,
+/// разбирает через `VectorDoc::from_svg_str`, загружает в холст рисования
+/// и переключает инструмент на SubSelection — тот же путь для кнопки
+/// "Редактировать SVG" что в Properties (для выбранной части), что в
+/// панели SVG (для любой части списком, см. `RightTab::SvgInspector`) —
+/// одна функция, чтобы поведение не могло разойтись между двумя местами.
+/// Возвращает готовое сообщение для статус-бара (успех или ошибка).
+fn start_editing_svg_part(
+    part_id: &str,
+    path: &str,
+    vector_doc: &mut pony_core::VectorDoc,
+    editing_part: &mut Option<String>,
+    active_tool: &mut Tool,
+    selected_shape_index: &mut Option<usize>,
+) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match pony_core::VectorDoc::from_svg_str(&text) {
+            Ok(doc) => {
+                let shape_count = doc.shapes.len();
+                *vector_doc = doc;
+                *editing_part = Some(part_id.to_string());
+                *active_tool = Tool::SubSelection;
+                *selected_shape_index = None;
+                format!("Редактирую '{part_id}' ({path}) — {shape_count} фигур(ы), инструмент SubSel")
+            }
+            Err(pony_core::VectorParseError::UnsupportedTag(tag)) if tag == "path" => {
+                // Честная, ожидаемая граница парсера (см. его же
+                // документацию в vector.rs): он понимает только теги,
+                // которые сам же пишет — rect/ellipse/line/polyline/
+                // polygon. Готовые демо-ассеты (mouth/tail/wing.svg)
+                // нарисованы через <path> с кривыми Безье вручную — их
+                // так открыть нельзя, и это не баг, а прямое следствие
+                // отсутствия поддержки <path> в редакторе (см. README,
+                // раздел про честные ограничения). Даём пользователю
+                // понятное объяснение вместо голого "path не понят".
+                format!(
+                    "'{part_id}' нарисован через <path> (кривые Безье) — такие SVG редактор пока не умеет открывать обратно на редактирование, только то, что нарисовано его собственными инструментами (Rect/Oval/Line/Pen/PolyStar)"
+                )
+            }
+            Err(err) => format!("Не удалось разобрать SVG: {err}"),
+        },
+        Err(err) => format!("Не удалось прочитать {path}: {err}"),
     }
 }
 
@@ -442,6 +800,54 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             // это ограничение только egui-оверлея, не движка.
             let screen_pts: Vec<egui::Pos2> = points.iter().map(|(x, y)| world_to_screen(glam::Vec2::new(*x, -*y))).collect();
             painter.add(egui::Shape::convex_polygon(screen_pts, rgba_to_color32(*fill), egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+        }
+        VectorShape::Path { nodes, closed, stroke, stroke_width, .. } => {
+            // Превью тесселирует каждый сегмент (прямой или кубическую
+            // Безье) в ломаную из фиксированного числа отрезков — только
+            // для оверлея на Stage. Сам сохранённый .svg хранит настоящие
+            // C/L-команды и рендерится точной кривой через resvg, эта
+            // тесселяция никак на него не влияет. Заливка НЕ рисуется в
+            // превью (в отличие от Polygon) — у открытого/сложного path
+            // с самопересечениями "заливка по контуру" через
+            // convex_polygon дала бы неверную картинку чаще, чем
+            // правильную; обводка честно показывает форму в любом случае.
+            const SEGMENTS: usize = 16;
+            let mut screen_pts: Vec<egui::Pos2> = Vec::new();
+            if !nodes.is_empty() {
+                screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
+                for i in 1..nodes.len() {
+                    tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts);
+                }
+                if *closed && nodes.len() > 1 {
+                    tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts);
+                }
+            }
+            painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+        }
+    }
+}
+
+/// Разбить один сегмент path (`from` -> `to`, кривая если у концов есть
+/// ручки, иначе прямая) на `SEGMENTS` отрезков через кубическую формулу
+/// Безье, добавляя экранные точки в `out` (первая точка сегмента уже есть
+/// в `out` от предыдущего вызова — добавляем только последующие).
+fn tessellate_segment(from: &pony_core::PathNode, to: &pony_core::PathNode, segments: usize, world_to_screen: &impl Fn(glam::Vec2) -> egui::Pos2, out: &mut Vec<egui::Pos2>) {
+    let p0 = from.position;
+    let p3 = to.position;
+    match (from.out_handle, to.in_handle) {
+        (None, None) => {
+            out.push(world_to_screen(glam::Vec2::new(p3.0, -p3.1)));
+        }
+        (out_h, in_h) => {
+            let p1 = out_h.unwrap_or(p0);
+            let p2 = in_h.unwrap_or(p3);
+            for s in 1..=segments {
+                let t = s as f32 / segments as f32;
+                let mt = 1.0 - t;
+                let x = mt * mt * mt * p0.0 + 3.0 * mt * mt * t * p1.0 + 3.0 * mt * t * t * p2.0 + t * t * t * p3.0;
+                let y = mt * mt * mt * p0.1 + 3.0 * mt * mt * t * p1.1 + 3.0 * mt * t * t * p2.1 + t * t * t * p3.1;
+                out.push(world_to_screen(glam::Vec2::new(x, -y)));
+            }
         }
     }
 }
@@ -585,6 +991,30 @@ fn main() {
     let mut character = build_walking_pony();
     let mut player = AnimationPlayer::new();
     player.play("Walk");
+
+    // --- сцена из нескольких персонажей ---
+    // Намеренно НЕ переписываю все существующие обращения к `character`/
+    // `player` на структуру со множеством персонажей — их сотни по всему
+    // файлу, и слепая замена — верный способ внести десятки тонких багов.
+    // Вместо этого: `character`/`player` остаются АКТИВНЫМ персонажем (как
+    // и раньше, весь существующий код работает без изменений), а
+    // ОСТАЛЬНЫЕ персонажи сцены лежат в `other_characters`. Переключение
+    // активного — явный своп: текущее состояние уходит в список, оттуда же
+    // достаётся новое. Дороже, чем прямая ссылка, зато не рискует
+    // сломать то, что уже работает.
+    struct CharacterSlot {
+        character: Character,
+        player: AnimationPlayer,
+        name: String,
+    }
+    let mut other_characters: Vec<CharacterSlot> = Vec::new();
+    let mut active_character_name = String::from("Pony 1");
+    let mut new_character_count: u32 = 1;
+    // Режимы таймлайна: "Character" — как и раньше, тайлайн активного
+    // персонажа (части/кости/ключи); "All" — обзорный, один ряд на
+    // персонажа сцены, клик по ряду делает его активным (drill-down).
+    let mut timeline_mode_all = false;
+
     let mut camera = pony_core::Camera::default();
     let script_engine = pony_script::ScriptEngine::new();
     let mut script_text = String::from("// Пример — жми \"Выполнить\"\npony.Smile(0.8);\npony.Blink();\ncamera.Zoom(1.2);");
@@ -598,7 +1028,10 @@ fn main() {
     let mut selected_layer: Option<String> = None;
     let mut active_tool = Tool::Selection;
     let mut right_tab = RightTab::Properties;
-    let mut stage_zoom: f32 = 1.0;
+    // 0.5, не 1.0 — SCENE_WIDTH/HEIGHT удвоены (см. выше), а экранный
+    // размер Stage = SCENE_WIDTH*stage_zoom; без компенсации персонаж по
+    // умолчанию занимал бы вдвое больше места на экране, чем раньше.
+    let mut stage_zoom: f32 = 0.5;
     let mut stage_pan = egui::Vec2::ZERO;
     let mut mouse_stage_pos: Option<egui::Pos2> = None;
     let mut fill_color = egui::Color32::from_rgb(222, 150, 195);
@@ -665,6 +1098,20 @@ fn main() {
     // групповых операций (скрыть/показать/удалить группой) ---
     let mut lasso_start: Option<glam::Vec2> = None;
     let mut multi_selected: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // --- редактирование уже созданной SVG-части (не только рисование с
+    // нуля) — id части, чей .svg сейчас загружен в vector_doc на
+    // редактирование; при сохранении обновляет ЕЁ, а не создаёт новую.
+    let mut editing_part: Option<String> = None;
+
+    // --- таймлайн: зум, выбранный ключевой кадр (для перетаскивания/Delete),
+    // и какой канал кости сейчас редактируется в сетке (PositionX/Y,
+    // Rotation, ScaleX/Y) — раньше был жёстко зашит на PositionY, из-за
+    // чего анимировать поворот или горизонтальное движение было вообще
+    // нельзя было через таймлайн, хотя модель данных это поддерживала.
+    let mut timeline_zoom: f32 = 1.0;
+    let mut selected_keyframe: Option<(String, i64)> = None;
+    let mut timeline_channel: BoneChannel = BoneChannel::PositionY;
 
     // --- производительность: не гонять дорогой GPU-рендер персонажа
     // (render+readback на CPU+перезалив текстуры) на каждый кадр во время
@@ -771,8 +1218,15 @@ fn main() {
                                 let color_image =
                                     egui::ColorImage::from_rgba_unmultiplied([rendered.width as usize, rendered.height as usize], &rendered.rgba);
                                 match &mut scene_texture {
-                                    Some(handle) => handle.set(color_image, egui::TextureOptions::NEAREST),
-                                    None => scene_texture = Some(egui_ctx.load_texture("pony-scene", color_image, egui::TextureOptions::NEAREST)),
+                                    // LINEAR, не NEAREST — раньше при увеличении Stage
+                                    // сцена растягивалась блоками (каждый исходный
+                                    // пиксель — жёсткий квадрат), и это было заметнее
+                                    // самого MSAA-сглаживания внутри рендера. LINEAR
+                                    // интерполирует между соседними пикселями текстуры
+                                    // при увеличении — сцена остаётся гладкой на любом
+                                    // зуме Stage, не только "нативном" 1:1.
+                                    Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
+                                    None => scene_texture = Some(egui_ctx.load_texture("pony-scene", color_image, egui::TextureOptions::LINEAR)),
                                 }
                                 last_frame_output = Some(rendered);
                             }
@@ -997,23 +1451,19 @@ fn main() {
                                             let anim_name = player.current_name().map(str_to_owned);
                                             let can_key = anim_name.is_some() && selected_layer.is_some();
                                             if ui
-                                                .add_enabled(can_key, egui::Button::new("Keyframe (позиция выбранного слоя)"))
+                                                .add_enabled(can_key, egui::Button::new(format!("Keyframe ({})", channel_label(timeline_channel))))
                                                 .on_disabled_hover_text("Нужны активная анимация и выбранный слой")
                                                 .clicked()
                                             {
                                                 if let (Some(anim_name), Some(layer_id)) = (anim_name, selected_layer.clone()) {
                                                     let bone = character.parts.get(&layer_id).and_then(|p| p.bone.clone());
                                                     if let Some(bone_id) = bone {
-                                                        let value = character
-                                                            .skeleton
-                                                            .find(&bone_id)
-                                                            .map(|b| b.local_transform.position.y)
-                                                            .unwrap_or(0.0);
+                                                        let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, timeline_channel)).unwrap_or(0.0);
                                                         let t = player.time();
                                                         push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                         if let Some(anim) = character.animations.get_mut(&anim_name) {
-                                                            insert_keyframe(anim, &bone_id, t, value);
-                                                            status_message = format!("Ключ на t={t:.2}с для кости '{bone_id}'");
+                                                            insert_keyframe(anim, &bone_id, timeline_channel, t, value);
+                                                            status_message = format!("Ключ на t={t:.2}с для кости '{bone_id}' ({})", channel_label(timeline_channel));
                                                         }
                                                     } else {
                                                         status_message = "У выбранного слоя нет кости — ключ ставить не к чему".into();
@@ -1283,13 +1733,6 @@ fn main() {
                                     });
                                 });
 
-                                if show_timeline {
-                                    egui::TopBottomPanel::bottom("timeline").min_height(160.0).resizable(true).show(ctx, |ui| {
-                                        ui.label("Timeline");
-                                        timeline_widget(ui, &mut character, &mut player, &mut playing, &mut hidden_layers, &mut locked_layers, &mut selected_layer);
-                                    });
-                                }
-
                                 egui::SidePanel::left("tools").resizable(false).min_width(64.0).show(ctx, |ui| {
                                     ui.vertical_centered_justified(|ui| {
                                         for tool in [Tool::Selection, Tool::SubSelection, Tool::FreeTransform, Tool::Lasso] {
@@ -1326,52 +1769,95 @@ fn main() {
                                         ui.separator();
                                         ui.label(format!("SVG: {} фигур(ы)", vector_doc.shapes.len()));
                                         if ui.button("Сохранить как слой").clicked() && !vector_doc.is_empty() {
-                                            svg_save_count += 1;
-                                            let path = format!("drawn_{svg_save_count}.svg");
-                                            match std::fs::write(&path, vector_doc.to_svg_string()) {
-                                                Ok(()) => {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
-                                                    let part_id = format!("drawn_{svg_save_count}");
+                                            let (min_x, min_y, max_x, max_y) = vector_doc.bounds().unwrap_or((0.0, 0.0, 1.0, 1.0));
+                                            let draw_center = glam::Vec2::new((min_x + max_x) / 2.0, -(min_y + max_y) / 2.0);
+                                            let draw_size = glam::Vec2::new((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
 
-                                                    // Часть должна встать ТУДА, где нарисована, и
-                                                    // ТОГО размера, какого нарисована — иначе
-                                                    // «нарисовал в углу» превращалось бы в
-                                                    // «появилось в центре персонажа непонятного
-                                                    // размера», и рисование было бы бесполезно.
-                                                    // Габарит рисунка в SVG-координатах (Y вниз),
-                                                    // мир — Y вверх, отсюда минус.
-                                                    let (min_x, min_y, max_x, max_y) = vector_doc.bounds().unwrap_or((0.0, 0.0, 1.0, 1.0));
-                                                    let draw_center = glam::Vec2::new((min_x + max_x) / 2.0, -(min_y + max_y) / 2.0);
-                                                    let draw_size = glam::Vec2::new((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
-
-                                                    // Привязываем к выбранной кости, если слой
-                                                    // выбран, иначе к корню тела — и пересчитываем
-                                                    // смещение так, чтобы часть осталась на месте.
-                                                    let bone_id = selected_layer
-                                                        .as_ref()
-                                                        .and_then(|id| character.parts.get(id))
-                                                        .and_then(|p| p.bone.clone())
-                                                        .unwrap_or_else(|| "Body".to_string());
-                                                    let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
-                                                    let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
-
-                                                    let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
-                                                    character.add_part(
-                                                        pony_core::part::Part::new(
-                                                            &part_id,
-                                                            pony_core::part::PartKind::Custom,
-                                                            pony_core::part::PartSource::Vector { path: path.clone() },
-                                                        )
-                                                        .with_bone(&bone_id)
-                                                        .with_pivot(pivot)
-                                                        .with_size(draw_size)
-                                                        .with_layer(max_layer + 1),
-                                                    );
-                                                    vector_doc.clear();
-                                                    selected_layer = Some(part_id.clone());
-                                                    status_message = format!("'{part_id}' -> {path}, кость '{bone_id}', {:.0}x{:.0}", draw_size.x, draw_size.y);
+                                            if let Some(edit_id) = editing_part.clone() {
+                                                // Обновляем СУЩЕСТВУЮЩУЮ часть на месте — тот же
+                                                // id, тот же файл на диске (перезаписываем), та же
+                                                // кость. Файл должен быть переINCLUDE тем же путём —
+                                                // иначе часть указывала бы на старый неотредактированный
+                                                // .svg. И критично: инвалидируем кэш текстур для
+                                                // этого пути, иначе персонаж продолжит рисоваться со
+                                                // старой (закэшированной) картинкой, хотя файл на диске
+                                                // уже другой.
+                                                if let Some(part) = character.parts.get(&edit_id).cloned() {
+                                                    if let pony_core::part::PartSource::Vector { path } = &part.source {
+                                                        match std::fs::write(path, vector_doc.to_svg_string()) {
+                                                            Ok(()) => {
+                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                                pony_renderer.invalidate_texture(path);
+                                                                let bone_world = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)).unwrap_or_default();
+                                                                let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
+                                                                if let Some(p) = character.parts.get_mut(&edit_id) {
+                                                                    p.pivot = pivot;
+                                                                    p.size = Some(draw_size);
+                                                                }
+                                                                vector_doc.clear();
+                                                                editing_part = None;
+                                                                status_message = format!("'{edit_id}' обновлён ({path})");
+                                                            }
+                                                            Err(err) => status_message = format!("Ошибка сохранения SVG: {err}"),
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Часть, которую редактировали, успели удалить
+                                                    // (например, через Edit > Delete layer) — не
+                                                    // молчим об этом, честно сообщаем и сбрасываем
+                                                    // режим редактирования, не создавая ничего левого.
+                                                    editing_part = None;
+                                                    status_message = "Редактируемая часть больше не существует — сохранение отменено".into();
                                                 }
-                                                Err(err) => status_message = format!("Ошибка сохранения SVG: {err}"),
+                                            } else {
+                                                svg_save_count += 1;
+                                                let path = format!("drawn_{svg_save_count}.svg");
+                                                match std::fs::write(&path, vector_doc.to_svg_string()) {
+                                                    Ok(()) => {
+                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                        let part_id = format!("drawn_{svg_save_count}");
+
+                                                        // Часть должна встать ТУДА, где нарисована, и
+                                                        // ТОГО размера, какого нарисована — иначе
+                                                        // «нарисовал в углу» превращалось бы в
+                                                        // «появилось в центре персонажа непонятного
+                                                        // размера», и рисование было бы бесполезно.
+                                                        // Габарит рисунка в SVG-координатах (Y вниз),
+                                                        // мир — Y вверх, отсюда минус.
+                                                        let bone_id = selected_layer
+                                                            .as_ref()
+                                                            .and_then(|id| character.parts.get(id))
+                                                            .and_then(|p| p.bone.clone())
+                                                            .unwrap_or_else(|| "Body".to_string());
+                                                        let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
+                                                        let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
+
+                                                        let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
+                                                        character.add_part(
+                                                            pony_core::part::Part::new(
+                                                                &part_id,
+                                                                pony_core::part::PartKind::Custom,
+                                                                pony_core::part::PartSource::Vector { path: path.clone() },
+                                                            )
+                                                            .with_bone(&bone_id)
+                                                            .with_pivot(pivot)
+                                                            .with_size(draw_size)
+                                                            .with_layer(max_layer + 1),
+                                                        );
+                                                        vector_doc.clear();
+                                                        selected_layer = Some(part_id.clone());
+                                                        status_message = format!("'{part_id}' -> {path}, кость '{bone_id}', {:.0}x{:.0}", draw_size.x, draw_size.y);
+                                                    }
+                                                    Err(err) => status_message = format!("Ошибка сохранения SVG: {err}"),
+                                                }
+                                            }
+                                        }
+                                        if editing_part.is_some() {
+                                            ui.small(format!("Редактируется: {}", editing_part.as_deref().unwrap_or("")));
+                                            if ui.button("Отменить редактирование").clicked() {
+                                                editing_part = None;
+                                                vector_doc.clear();
+                                                status_message = "Редактирование отменено".into();
                                             }
                                         }
                                         if ui.button("Очистить холст").clicked() {
@@ -1394,6 +1880,7 @@ fn main() {
                                                 RightTab::Lighting,
                                                 RightTab::Particles,
                                                 RightTab::Bones,
+                                                RightTab::SvgInspector,
                                             ] {
                                                 if ui.selectable_label(right_tab == tab, tab.label()).clicked() {
                                                     right_tab = tab;
@@ -1407,6 +1894,29 @@ fn main() {
                                                     if let Some(part) = character.parts.get(&id).cloned() {
                                                         ui.label(format!("ID: {}", part.id));
                                                         ui.label(format!("Вид: {:?}", part.kind));
+
+                                                        // "Использование" замкнутого цикла SVG:
+                                                        // создание/редактирование/использование —
+                                                        // часть, чей источник уже .svg, можно открыть
+                                                        // обратно на редактирование теми же
+                                                        // инструментами (Rect/SubSelection/...), что
+                                                        // и при рисовании с нуля, а не только двигать
+                                                        // как единое целое. Та же кнопка есть и в
+                                                        // отдельной вкладке "SVG" (SVG Inspector) —
+                                                        // там видны СРАЗУ все SVG-части персонажа,
+                                                        // не только выбранная.
+                                                        if let pony_core::part::PartSource::Vector { path } = &part.source {
+                                                            if ui.button("Редактировать SVG").clicked() {
+                                                                status_message = start_editing_svg_part(
+                                                                    &id,
+                                                                    path,
+                                                                    &mut vector_doc,
+                                                                    &mut editing_part,
+                                                                    &mut active_tool,
+                                                                    &mut selected_shape_index,
+                                                                );
+                                                            }
+                                                        }
                                                         ui.separator();
 
                                                         // Перепривязка к другой кости. Смещение
@@ -1778,6 +2288,159 @@ fn main() {
                                                     }
                                                 }
                                             }
+                                            // SVG Inspector (раздел 79 ТЗ) — специальная панель:
+                                            // список ВСЕХ SVG-частей персонажа сразу, а не только
+                                            // той, что выбрана на Stage/в Timeline. Раньше кнопка
+                                            // "Редактировать SVG" была только в Properties и
+                                            // появлялась лишь для уже выбранной части — легко
+                                            // было не найти её вообще, если не знать заранее, что
+                                            // искать. Здесь — явный, самодостаточный список.
+                                            RightTab::SvgInspector => {
+                                                let mut svg_parts: Vec<(String, String, i32, Option<String>)> = character
+                                                    .parts
+                                                    .iter()
+                                                    .filter_map(|(id, p)| match &p.source {
+                                                        pony_core::part::PartSource::Vector { path } => Some((id.clone(), path.clone(), p.layer, p.bone.clone())),
+                                                        _ => None,
+                                                    })
+                                                    .collect();
+                                                svg_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+                                                ui.label(format!("SVG-частей в документе: {}", svg_parts.len()));
+                                                ui.small("Раздел 79 ТЗ (\"SVG Inspector\"): структура, атрибуты и прямое редактирование SVG-частей персонажа.");
+                                                ui.separator();
+
+                                                if svg_parts.is_empty() {
+                                                    ui.label("Ни одна часть персонажа пока не сделана из SVG.");
+                                                    ui.small("Нарисуй фигуру любым инструментом (Rect/Oval/.../Pen) и нажми \"Сохранить как слой\" на левой панели — она появится здесь.");
+                                                } else {
+                                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                                        for (id, path, layer, bone) in &svg_parts {
+                                                            ui.group(|ui| {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.strong(id);
+                                                                    if editing_part.as_deref() == Some(id.as_str()) {
+                                                                        ui.colored_label(egui::Color32::from_rgb(120, 220, 140), "(редактируется)");
+                                                                    }
+                                                                });
+                                                                ui.small(format!("Файл: {path}"));
+                                                                ui.small(format!("Кость: {} · Слой: {layer}", bone.as_deref().unwrap_or("(нет)")));
+                                                                ui.horizontal(|ui| {
+                                                                    if ui.button("Редактировать SVG").clicked() {
+                                                                        status_message = start_editing_svg_part(id, path, &mut vector_doc, &mut editing_part, &mut active_tool, &mut selected_shape_index);
+                                                                    }
+                                                                    if ui.button("Выбрать на Stage").clicked() {
+                                                                        selected_layer = Some(id.clone());
+                                                                        right_tab = RightTab::Properties;
+                                                                    }
+                                                                });
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+
+                                // Timeline — TopBottomPanel::bottom, но добавлена ЗДЕСЬ,
+                                // после боковых панелей, а не раньше них. Раньше стояла
+                                // перед SidePanel::left/right — из-за чего при своей
+                                // раскладке получала полную ширину окна (боковые панели
+                                // ещё не "откусили" себе место), и часть её собственных
+                                // виджетов (слайдер зума) оказывалась под координатами,
+                                // где позже поверх рисовалась левая панель инструментов, и
+                                // пряталась под ней — не баг слайдера, баг порядка панелей.
+                                // Тот же класс проблемы уже был с левой/нижней панелью
+                                // раньше в этом проекте — правило "top -> bottom -> side ->
+                                // central" здесь нарушалось конкретно для этой панели.
+                                if show_timeline {
+                                    egui::TopBottomPanel::bottom("timeline").min_height(160.0).resizable(true).show(ctx, |ui| {
+                                        // --- переключатель персонажей сцены + режим таймлайна ---
+                                        let mut switch_to: Option<usize> = None; // индекс в other_characters
+                                        ui.horizontal(|ui| {
+                                            ui.label("Timeline:");
+                                            ui.selectable_value(&mut timeline_mode_all, false, "Персонаж");
+                                            ui.selectable_value(&mut timeline_mode_all, true, "Все");
+                                            ui.separator();
+                                            if ui.button("+ Новый персонаж").clicked() {
+                                                // Текущий активный уходит в список остальных, на
+                                                // его место встаёт свежий пустой персонаж — та же
+                                                // логика "своп", что и при обычном переключении,
+                                                // просто с новым слотом вместо существующего.
+                                                new_character_count += 1;
+                                                let new_name = format!("Pony {new_character_count}");
+                                                other_characters.push(CharacterSlot {
+                                                    character: std::mem::replace(&mut character, build_walking_pony()),
+                                                    player: std::mem::replace(&mut player, AnimationPlayer::new()),
+                                                    name: active_character_name.clone(),
+                                                });
+                                                player.play("Walk");
+                                                active_character_name = new_name;
+                                                selected_layer = None;
+                                                selected_bone = None;
+                                                status_message = format!("Создан персонаж '{active_character_name}'");
+                                            }
+                                            if ui.add_enabled(!other_characters.is_empty(), egui::Button::new("Удалить активного")).clicked() {
+                                                if let Some(next) = other_characters.pop() {
+                                                    character = next.character;
+                                                    player = next.player;
+                                                    let deleted_name = std::mem::replace(&mut active_character_name, next.name);
+                                                    selected_layer = None;
+                                                    selected_bone = None;
+                                                    status_message = format!("Персонаж '{deleted_name}' удалён, активен '{active_character_name}'");
+                                                }
+                                            }
+                                        });
+
+                                        if timeline_mode_all {
+                                            ui.separator();
+                                            ui.small("Клик по строке — сделать персонажа активным и войти в его таймлайн (Character).");
+                                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                                let playing_mark = if playing { "▶" } else { "⏸" };
+                                                ui.label(format!("{playing_mark} {active_character_name} (активен) — {} частей · {} костей", character.parts.len(), character.skeleton.bones.len()));
+                                                character_timeline_strip(ui, &character, &player, true);
+                                                ui.add_space(4.0);
+
+                                                for (i, slot) in other_characters.iter().enumerate() {
+                                                    let playing_mark = if slot.player.current_name().is_some() { "▶" } else { "⏸" };
+                                                    ui.label(format!("{playing_mark} {} — {} частей · {} костей", slot.name, slot.character.parts.len(), slot.character.skeleton.bones.len()));
+                                                    if character_timeline_strip(ui, &slot.character, &slot.player, false).clicked() {
+                                                        switch_to = Some(i);
+                                                    }
+                                                    ui.add_space(4.0);
+                                                }
+                                            });
+                                        } else {
+                                            ui.label(format!("Timeline — {active_character_name}"));
+                                            timeline_widget(
+                                                ui,
+                                                &mut character,
+                                                &mut player,
+                                                &mut playing,
+                                                &mut hidden_layers,
+                                                &mut locked_layers,
+                                                &mut selected_layer,
+                                                &mut timeline_zoom,
+                                                &mut selected_keyframe,
+                                                &mut timeline_channel,
+                                            );
+                                        }
+
+                                        // Своп персонажа-по-клику из режима "Все" — тот же приём,
+                                        // что и в "+ Новый"/"Удалить": текущий активный уходит в
+                                        // список, выбранный оттуда встаёт на его место.
+                                        if let Some(i) = switch_to {
+                                            let picked = other_characters.remove(i);
+                                            other_characters.push(CharacterSlot {
+                                                character: std::mem::replace(&mut character, picked.character),
+                                                player: std::mem::replace(&mut player, picked.player),
+                                                name: std::mem::replace(&mut active_character_name, picked.name),
+                                            });
+                                            selected_layer = None;
+                                            selected_bone = None;
+                                            timeline_mode_all = false; // drill-down: сразу в таймлайн выбранного
+                                            status_message = format!("Активен '{active_character_name}'");
                                         }
                                     });
                                 }
@@ -2412,4 +3075,71 @@ fn main() {
             }
         })
         .expect("event loop error");
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+    use pony_core::animation::Animation;
+
+    fn test_anim() -> Animation {
+        Animation { name: "Test".into(), duration: 1.0, looping: false, tracks: Vec::new() }
+    }
+
+    #[test]
+    fn insert_then_remove_keyframe_round_trips_the_value() {
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.5, 12.5);
+        assert_eq!(anim.tracks.len(), 1, "должна создаться дорожка");
+        let removed = remove_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.5);
+        assert_eq!(removed, Some(12.5));
+        assert!(anim.tracks[0].keyframes.is_empty(), "ключ должен реально исчезнуть из дорожки");
+    }
+
+    #[test]
+    fn remove_keyframe_at_wrong_time_returns_none_and_does_not_touch_others() {
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.5, 12.5);
+        let removed = remove_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.9); // другое время
+        assert_eq!(removed, None);
+        assert_eq!(anim.tracks[0].keyframes.len(), 1, "существующий ключ не должен был пострадать");
+    }
+
+    #[test]
+    fn dragging_a_keyframe_to_a_new_time_is_remove_then_insert() {
+        // Симулируем то, что делает drag-обработчик в timeline_widget: убрать
+        // старый ключ, поставить новый с тем же значением на новом времени.
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.2, 7.0);
+        let value = remove_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.2).expect("ключ должен был найтись");
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.8, value);
+
+        assert_eq!(anim.tracks[0].keyframes.len(), 1, "должен остаться ровно один ключ, не два");
+        let kf = &anim.tracks[0].keyframes[0];
+        assert!((kf.time - 0.8).abs() < 1e-4, "ключ должен переехать на новое время");
+        match kf.value {
+            pony_core::animation::AnimValue::Float(v) => assert!((v - 7.0).abs() < 1e-4, "значение должно сохраниться при перетаскивании"),
+            _ => panic!("ожидали AnimValue::Float"),
+        }
+    }
+
+    #[test]
+    fn insert_keyframe_extends_duration_when_keyframe_is_past_the_end() {
+        let mut anim = test_anim();
+        assert_eq!(anim.duration, 1.0);
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 2.5, 0.0);
+        assert!((anim.duration - 2.5).abs() < 1e-4, "длительность анимации должна вырасти под новый ключ");
+    }
+
+    #[test]
+    fn insert_keyframe_at_existing_time_replaces_not_duplicates() {
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.3, 1.0);
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.3, 99.0);
+        assert_eq!(anim.tracks[0].keyframes.len(), 1, "не должно быть двух ключей на одном времени");
+        match anim.tracks[0].keyframes[0].value {
+            pony_core::animation::AnimValue::Float(v) => assert!((v - 99.0).abs() < 1e-4),
+            _ => panic!(),
+        }
+    }
 }

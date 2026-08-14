@@ -269,7 +269,15 @@ impl Renderer {
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            // 4x MSAA — без этого края частей (особенно повёрнутых,
+            // не выровненных по осям — колышущийся хвост, наклонённая
+            // голова) рисуются "лесенкой", по одному ровному пикселю на
+            // край, и именно это выглядит как "пиксельная графика", а не
+            // сам факт растрового рендера. Требует рендерить в отдельную
+            // мультисемпл-текстуру и резолвить её в обычную (см.
+            // MSAA_SAMPLES и create_msaa_texture ниже) — цена: одна лишняя
+            // текстура на кадр, для сцены в пару сотен пикселей это дёшево.
+            multisample: wgpu::MultisampleState { count: MSAA_SAMPLES, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
         });
 
@@ -318,6 +326,8 @@ impl Renderer {
     ) -> FrameOutput {
         let texture = create_frame_texture(ctx, width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_texture = create_msaa_texture(ctx, width, height);
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let projection = compute_projection(width, height, camera, time);
 
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -443,8 +453,12 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pony-frame-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    // Рисуем в мультисемпл-текстуру, GPU сам сводит
+                    // MSAA_SAMPLES сэмплов в `view` (обычную, читаемую
+                    // обратно на CPU) через resolve_target при завершении
+                    // прохода — не нужно резолвить вручную.
+                    view: &msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.53, g: 0.81, b: 0.92, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
@@ -488,6 +502,13 @@ impl Renderer {
         self.textures.memory_budget_bytes()
     }
 
+    /// См. `TextureCache::invalidate` — нужен после перезаписи ассета на
+    /// диске (например, повторного сохранения отредактированного SVG),
+    /// иначе персонаж продолжит рисоваться со старой текстурой из кэша.
+    pub fn invalidate_texture(&mut self, key: &str) {
+        self.textures.invalidate(key);
+    }
+
     pub fn render_particles(
         &mut self,
         ctx: &GpuContext,
@@ -499,6 +520,8 @@ impl Renderer {
     ) -> FrameOutput {
         let texture = create_frame_texture(ctx, width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_texture = create_msaa_texture(ctx, width, height);
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let projection = compute_projection(width, height, camera, time);
 
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -544,8 +567,8 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pony-particle-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         // Тёмный нейтральный фон (не небо render_character) —
                         // отдельная сцена только для частиц, чтобы их было
@@ -572,6 +595,11 @@ impl Renderer {
     }
 }
 
+/// Число сэмплов MSAA. 4 — стандартный практичный выбор (заметно
+/// сглаживает края, не 8x/16x-цена по памяти и производительности,
+/// которая для сцены в пару сотен пикселей всё равно избыточна).
+const MSAA_SAMPLES: u32 = 4;
+
 fn create_frame_texture(ctx: &GpuContext, width: u32, height: u32) -> wgpu::Texture {
     ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("pony-frame-target"),
@@ -581,6 +609,24 @@ fn create_frame_texture(ctx: &GpuContext, width: u32, height: u32) -> wgpu::Text
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// Мультисемпл-текстура для рендера (не читается назад напрямую — только
+/// как источник для `resolve_target` в `RenderPassColorAttachment`, куда
+/// GPU сам сводит `MSAA_SAMPLES` сэмплов в обычный пиксель). Не может
+/// иметь `COPY_SRC`/`TEXTURE_BINDING` — мультисемпл-текстуры так не
+/// читаются, отсюда и resolve в отдельную обычную текстуру.
+fn create_msaa_texture(ctx: &GpuContext, width: u32, height: u32) -> wgpu::Texture {
+    ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pony-frame-target-msaa"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     })
 }

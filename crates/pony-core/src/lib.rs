@@ -19,4 +19,4 @@ pub use lighting::{AmbientLight, Lighting, PointLight, SunLight};
 pub use orientation::apply_yaw_2_5d;
 pub use particles::{Particle, ParticleEmitter, ParticleKind};
 pub use player::AnimationPlayer;
-pub use vector::{RgbaColor, VectorDoc, VectorShape};
+pub use vector::{NodeType, PathNode, PathPointKind, RgbaColor, VectorDoc, VectorParseError, VectorShape};
