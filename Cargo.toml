@@ -37,3 +37,8 @@ wgpu = "0.19"
 rayon = "=1.8.1"
 pollster = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
+# Тот же потолок, что и у usvg 0.44 (см. pony-render/Cargo.toml) —
+# roxmltree 0.20 уже тянется транзитивно через usvg, зафиксирована здесь
+# явно, т.к. теперь pony-core тоже зависит от неё напрямую (см. её
+# Cargo.toml — VectorDoc::from_svg_str).
+roxmltree = "0.20"
