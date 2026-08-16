@@ -126,6 +126,9 @@ fn main() {
     look_demo(&render_cluster);
 
     println!();
+    mask_demo(&render_cluster);
+
+    println!();
     run_asset_demo();
 }
 
@@ -673,6 +676,71 @@ fn look_demo(render_cluster: &RenderCluster) {
 
     save_ppm("look_neutral.ppm", neutral_frame.width, neutral_frame.height, &neutral_frame.rgba);
     save_ppm("look_up.ppm", looking_frame.width, looking_frame.height, &looking_frame.rgba);
+}
+
+/// Masks/Clipping (раздел 60 ТЗ): `content` — часть-фон (Body-заглушка),
+/// `mask_shape` — часть-маска (Custom-заглушка) вдвое ýже content и
+/// сдвинутая так, чтобы покрывать только его левую половину. Проверяем
+/// РЕАЛЬНЫМИ пикселями (не "на глаз"), что: (1) под маской видна ЛЕВАЯ
+/// половина content, (2) правая половина — вне маски — обрезана до фона,
+/// (3) без `clip_by` та же правая точка видна как обычно (доказывает,
+/// что скрытие в (2) — заслуга именно маски, а не случайной дыры в квадах).
+fn mask_demo(render_cluster: &RenderCluster) {
+    println!("=== Маски/Clipping (раздел 60 ТЗ): растровая альфа-маска по другой части ===");
+    if render_cluster.is_cpu_only() {
+        println!("Рендер-кластер пуст — демо пропущено, нужен CPU-фоллбек рендерер.");
+        return;
+    }
+
+    let ctx = &render_cluster.contexts[0];
+    let mut renderer = Renderer::new(ctx);
+    let camera = Camera::default();
+
+    let mut character = Character::new("MaskDemoPony");
+    character.skeleton.add_bone(pony_core::skeleton::Bone {
+        id: "Root".into(),
+        parent: None,
+        local_transform: pony_core::skeleton::Transform2D { position: glam::Vec2::ZERO, rotation: 0.0, scale: glam::Vec2::ONE },
+        length: 1.0,
+    });
+    character.add_part(Part::new("content", PartKind::Body, PartSource::Png { path: "assets/pony/body.png".into() }).with_bone("Root"));
+    let mut mask_part = Part::new("mask_shape", PartKind::Custom, PartSource::Png { path: "assets/mask_demo_shape.png".into() }).with_bone("Root");
+    mask_part.size = Some(glam::Vec2::new(25.0, 34.0));
+    mask_part.pivot = glam::Vec2::new(-12.5, 0.0);
+    character.add_part(mask_part);
+    character.parts.get_mut("content").unwrap().clip_by = Some("mask_shape".to_string());
+
+    let width = 200u32;
+    let height = 150u32;
+    let masked = renderer.render_character(ctx, &character, width, height, &camera, 0.0, &pony_core::Lighting::default(), None);
+
+    let mut unmasked_character = character.clone();
+    unmasked_character.parts.get_mut("content").unwrap().clip_by = None;
+    unmasked_character.parts.remove("mask_shape");
+    let unmasked = renderer.render_character(ctx, &unmasked_character, width, height, &camera, 0.0, &pony_core::Lighting::default(), None);
+
+    let pixel_at = |frame: &pony_render::FrameOutput, x: u32, y: u32| -> [u8; 4] {
+        let idx = ((y * frame.width + x) * 4) as usize;
+        [frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2], frame.rgba[idx + 3]]
+    };
+
+    let (cy, left_x, right_x) = (height / 2, 85u32, 115u32);
+    let bg = pixel_at(&masked, 2, 2);
+    let left_masked = pixel_at(&masked, left_x, cy);
+    let right_masked = pixel_at(&masked, right_x, cy);
+    let right_unmasked = pixel_at(&unmasked, right_x, cy);
+
+    println!("С маской:  слева(x={left_x})={left_masked:?}  справа(x={right_x})={right_masked:?}  фон={bg:?}");
+    println!("Без маски: справа(x={right_x})={right_unmasked:?}");
+
+    let left_visible = left_masked[3] > 200 && left_masked != bg;
+    let right_hidden = right_masked[3] < 50 || right_masked == bg;
+    let right_visible_without_mask = right_unmasked[3] > 200 && right_unmasked != bg;
+    println!(
+        "Проверки: слева видно под маской={left_visible}, справа обрезано маской={right_hidden}, справа видно без маски={right_visible_without_mask}"
+    );
+
+    save_ppm("mask_demo.ppm", masked.width, masked.height, &masked.rgba);
 }
 
 fn run_asset_demo() {

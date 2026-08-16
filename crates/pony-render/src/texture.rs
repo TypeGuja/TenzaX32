@@ -13,7 +13,15 @@ use std::collections::HashMap;
 use crate::GpuContext;
 
 pub struct LoadedTexture {
-    pub view: wgpu::TextureView,
+    // `Rc`, не голый `wgpu::TextureView` (который не реализует `Clone`) —
+    // раздел 60 ТЗ (Masks/Clipping): рендер части с маской должен держать
+    // ДВЕ ссылки на view одновременно (собственная текстура части + текстура
+    // части-маски) при сборке одного bind group — `&LoadedTexture` из кэша
+    // даёт заимствование, живущее не дольше следующего вызова `get_or_load_*`
+    // (кэш может вытеснить/перезаписать запись), а нужно держать оба вида
+    // видимыми одновременно вплоть до `create_bind_group`. `Rc::clone` —
+    // дешёвое приращение счётчика, не копирование GPU-ресурса.
+    pub view: std::rc::Rc<wgpu::TextureView>,
     pub width: u32,
     pub height: u32,
 }
@@ -245,7 +253,7 @@ fn upload_rgba(ctx: &GpuContext, label: Option<&str>, data: &[u8], width: u32, h
         },
         wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
     );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let view = std::rc::Rc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
     LoadedTexture { view, width, height }
 }
 
@@ -431,7 +439,7 @@ mod vector_roundtrip_tests {
     // XML/SVG, здесь бы это всплыло — независимая, не только "текст
     // содержит нужную подстроку", а "настоящий SVG-парсер согласен, что
     // это валидный документ, и рисует ожидаемый цвет".
-    use pony_core::{RgbaColor, VectorDoc, VectorShape};
+    use pony_core::{GradientDef, GradientKind, GradientStop, RgbaColor, VectorDoc, VectorShape};
 
     #[test]
     fn drawn_rect_round_trips_through_a_real_svg_parser() {
@@ -442,6 +450,7 @@ mod vector_roundtrip_tests {
             w: 40.0,
             h: 30.0,
             fill: RgbaColor::new(30, 200, 90, 255),
+            fill_gradient: None,
             stroke: RgbaColor::new(0, 0, 0, 0),
             stroke_width: 0.0,
         });
@@ -476,6 +485,7 @@ mod vector_roundtrip_tests {
             rx: 18.0,
             ry: 18.0,
             fill: RgbaColor::new(220, 40, 40, 255),
+            fill_gradient: None,
             stroke: RgbaColor::new(0, 0, 0, 0),
             stroke_width: 0.0,
         });
@@ -491,6 +501,80 @@ mod vector_roundtrip_tests {
         assert!(tree.size().width() > 0.0);
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn drawn_gradient_ellipse_renders_the_correct_stop_color_through_a_real_svg_parser() {
+        // Раздел 60 ТЗ (Gradients) — тот же принцип, что и у соседних
+        // тестов в этом модуле: не только "сериализатор написал текст,
+        // похожий на градиент", а "настоящий resvg-рендер согласен, что
+        // получившийся SVG рисует именно тот цвет, который должен быть в
+        // данной точке градиента". pony-core сам этого проверить не может
+        // (у него нет resvg/tiny-skia зависимостей — только у pony-render),
+        // это дополняет чисто-парсерные round-trip тесты в
+        // `pony_core::vector::tests::gradient_svg_round_trip_...`.
+        let mut doc = VectorDoc::new();
+        doc.upsert_gradient(GradientDef::new(
+            "sunset",
+            GradientKind::Radial {
+                cx: 20.0,
+                cy: 20.0,
+                r: 18.0,
+            },
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(255, 200, 0, 255),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(20, 20, 200, 255),
+                },
+            ],
+        ));
+        doc.add(VectorShape::Ellipse {
+            cx: 20.0,
+            cy: 20.0,
+            rx: 18.0,
+            ry: 18.0,
+            fill: RgbaColor::new(0, 0, 0, 255),
+            fill_gradient: Some("sunset".to_string()),
+            stroke: RgbaColor::new(0, 0, 0, 0),
+            stroke_width: 0.0,
+        });
+        let svg_text = doc.to_svg_string();
+
+        let opt = usvg::Options::default();
+        let tree = usvg::Tree::from_str(&svg_text, &opt).expect("сгенерированный SVG должен быть валидным для usvg");
+        let size = tree.size();
+        let width = size.width().ceil() as u32;
+        let height = size.height().ceil() as u32;
+        let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
+        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+
+        // Центр эллипса — начало градиента (t=0) — должен быть близко к
+        // первому стопу (жёлто-оранжевому), не к плоскому fallback-цвету
+        // фигуры (0,0,0) и не ко второму стопу (20,20,200). Сравнение с
+        // допуском, а не точным равенством: resvg интерполирует градиент в
+        // sRGB-корректном цветовом пространстве (не наивный линейный RGB,
+        // как `GradientDef::sample`), плюс пиксель-центр не идеально
+        // совпадает с математическим центром эллипса на растровой сетке —
+        // некоторая погрешность от антиалиасинга ожидаема и не является
+        // багом.
+        let cx = (width / 2) as usize;
+        let cy = (height / 2) as usize;
+        let idx = (cy * width as usize + cx) * 4;
+        let data = pixmap.data();
+        let expected = [255u8, 200, 0];
+        for (channel, exp) in data[idx..idx + 3].iter().zip(expected.iter()) {
+            let diff = (*channel as i32 - *exp as i32).abs();
+            assert!(
+                diff <= 20,
+                "центр радиального градиента должен быть близок к первому стопу {:?}, получено {:?}",
+                expected,
+                &data[idx..idx + 3]
+            );
+        }
     }
 }
 

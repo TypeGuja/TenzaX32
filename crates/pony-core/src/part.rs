@@ -67,6 +67,30 @@ pub struct Part {
     pub layer: i32,
     /// К какой кости прикреплена часть.
     pub bone: Option<BoneId>,
+    /// Clipping mask (раздел 5-6, 60 ТЗ: "Masks"/"Clipping" в списке
+    /// возможностей рендера) — id другой части этого же персонажа, чья
+    /// АЛЬФА (не цвет — раздел 60 отдельно перечисляет Masks рядом с
+    /// Alpha Blending, стандартная растровая семантика клип-маски) режет
+    /// альфу ЭТОЙ части: итоговый пиксель видим только там, где видима и
+    /// эта часть, И часть-маска. Часть-маска сама по себе продолжает
+    /// рисоваться как обычно (это не `clipPath`, который делает маску
+    /// невидимой сам по себе, — это раздельные слои, как маскирующий слой
+    /// в Adobe Animate/Photoshop: если маска не должна быть видна сама,
+    /// её просто не добавляют как отдельную видимую часть, либо кладут её
+    /// на невидимый вспомогательный layer). `None` — часть рисуется без
+    /// ограничения маской, как раньше. `#[serde(default)]` — старые
+    /// `.asset` без масок продолжают загружаться.
+    #[serde(default)]
+    pub clip_by: Option<String>,
+    /// Организационная группа (раздел 27 ТЗ, `<g>`) — НЕ то же самое, что
+    /// `bone`: `bone` определяет, как часть деформируется при анимации
+    /// (Skeleton-иерархия), `group` — как части организованы в Scene
+    /// Graph/панели слоёв для выделения/скрытия/перемещения группой (см.
+    /// `crate::group`). Части одной группы могут быть прикреплены к
+    /// разным костям. `#[serde(default)]` — старые `.asset`-файлы без
+    /// групп продолжают загружаться (все части просто верхнего уровня).
+    #[serde(default)]
+    pub group: Option<crate::group::GroupId>,
 }
 
 impl Part {
@@ -79,11 +103,23 @@ impl Part {
             size: None,
             layer: 0,
             bone: None,
+            clip_by: None,
+            group: None,
         }
     }
 
     pub fn with_bone(mut self, bone: impl Into<String>) -> Self {
         self.bone = Some(bone.into());
+        self
+    }
+
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    pub fn with_clip_by(mut self, mask_part_id: impl Into<String>) -> Self {
+        self.clip_by = Some(mask_part_id.into());
         self
     }
 

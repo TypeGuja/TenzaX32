@@ -144,6 +144,10 @@ enum RightTab {
     Particles,
     Bones,
     SvgInspector,
+    Symbols,
+    Groups,
+    Gradients,
+    Boolean,
 }
 
 impl RightTab {
@@ -160,6 +164,10 @@ impl RightTab {
             RightTab::Particles => "Particles",
             RightTab::Bones => "Bones",
             RightTab::SvgInspector => "SVG",
+            RightTab::Symbols => "Symbols",
+            RightTab::Groups => "Groups",
+            RightTab::Gradients => "Gradients",
+            RightTab::Boolean => "Combine Paths",
         }
     }
 }
@@ -725,27 +733,23 @@ fn start_editing_svg_part(
         Ok(text) => match pony_core::VectorDoc::from_svg_str(&text) {
             Ok(doc) => {
                 let shape_count = doc.shapes.len();
+                // Раздел 29 ТЗ: неизвестные элементы (текст, градиенты как
+                // отдельные объекты, use/symbol и т.п. — см. `unsupported`
+                // в vector.rs) не должны молча теряться из вида — редактор
+                // открывает всё, что смог разобрать, но честно называет,
+                // что пропущено, вместо тихой потери данных.
+                let unsupported_note = if doc.unsupported.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (пропущены нередактируемые элементы: {})", doc.unsupported.join(", "))
+                };
                 *vector_doc = doc;
                 *editing_part = Some(part_id.to_string());
                 *active_tool = Tool::SubSelection;
                 *selected_shape_index = None;
-                format!("Редактирую '{part_id}' ({path}) — {shape_count} фигур(ы), инструмент SubSel")
+                format!("Редактирую '{part_id}' ({path}) — {shape_count} фигур(ы), инструмент SubSel{unsupported_note}")
             }
-            Err(pony_core::VectorParseError::UnsupportedTag(tag)) if tag == "path" => {
-                // Честная, ожидаемая граница парсера (см. его же
-                // документацию в vector.rs): он понимает только теги,
-                // которые сам же пишет — rect/ellipse/line/polyline/
-                // polygon. Готовые демо-ассеты (mouth/tail/wing.svg)
-                // нарисованы через <path> с кривыми Безье вручную — их
-                // так открыть нельзя, и это не баг, а прямое следствие
-                // отсутствия поддержки <path> в редакторе (см. README,
-                // раздел про честные ограничения). Даём пользователю
-                // понятное объяснение вместо голого "path не понят".
-                format!(
-                    "'{part_id}' нарисован через <path> (кривые Безье) — такие SVG редактор пока не умеет открывать обратно на редактирование, только то, что нарисовано его собственными инструментами (Rect/Oval/Line/Pen/PolyStar)"
-                )
-            }
-            Err(err) => format!("Не удалось разобрать SVG: {err}"),
+            Err(err) => format!("Не удалось разобрать SVG '{part_id}' ({path}): {err}"),
         },
         Err(err) => format!("Не удалось прочитать {path}: {err}"),
     }
@@ -759,28 +763,112 @@ fn rgba_to_color32(c: pony_core::RgbaColor) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
 
+/// Короткая человекочитаемая метка типа фигуры — для списков выбора в
+/// панелях (Boolean/Combine Paths), где нужно показать пользователю, что
+/// он вообще выбирает, без полного дампа полей фигуры.
+fn shape_kind_label(shape: &pony_core::VectorShape) -> &'static str {
+    match shape {
+        pony_core::VectorShape::Rect { .. } => "Rect",
+        pony_core::VectorShape::Ellipse { .. } => "Ellipse",
+        pony_core::VectorShape::Polygon { .. } => "Polygon",
+        pony_core::VectorShape::Path { closed, .. } => {
+            if *closed {
+                "Path (closed)"
+            } else {
+                "Path (open)"
+            }
+        }
+        pony_core::VectorShape::Line { .. } => "Line",
+        pony_core::VectorShape::Polyline { .. } => "Polyline",
+        pony_core::VectorShape::Instance { .. } => "Instance",
+    }
+}
+
+fn boolean_op_label(op: pony_core::BooleanOp) -> &'static str {
+    match op {
+        pony_core::BooleanOp::Union => "Union",
+        pony_core::BooleanOp::Difference => "Difference",
+        pony_core::BooleanOp::Intersection => "Intersection",
+        pony_core::BooleanOp::Xor => "XOR",
+        pony_core::BooleanOp::Divide => "Divide",
+    }
+}
+
+/// Раздел 60 ТЗ (Gradients): строит функцию "цвет фигуры в точке
+/// document-space координат", единую для всех fill-вариантов превью
+/// (Rect/Ellipse/Polygon/Path) — либо всегда один и тот же плоский `fill`
+/// (обычная заливка), либо честный per-vertex градиент, если `fill_gradient`
+/// резолвится в `vector_doc.gradients` (см. `GradientDef::sample`/
+/// `gradient_t_at`). Висячая/пустая ссылка — тихий откат на `fill`, тот же
+/// принцип, что и у `resolved_fill_paint` в `pony-core` (сериализация в SVG).
+fn shape_fill_color_fn<'a>(fill: pony_core::RgbaColor, fill_gradient: Option<&str>, vector_doc: &'a pony_core::VectorDoc) -> impl Fn(f32, f32) -> egui::Color32 + 'a {
+    let resolved: Option<pony_core::GradientDef> = fill_gradient.and_then(|name| vector_doc.find_gradient(name)).cloned();
+    move |x: f32, y: f32| -> egui::Color32 {
+        match &resolved {
+            Some(g) => rgba_to_color32(g.sample(pony_core::gradient_t_at(&g.kind, x, y))),
+            None => rgba_to_color32(fill),
+        }
+    }
+}
+
 /// Отрисовать одну сохранённую в `VectorDoc` фигуру поверх Stage — экранные
 /// координаты вычисляет `world_to_screen`. Хранение фигур — в SVG-системе
 /// координат (Y вниз), а весь остальной Stage — в мировой (Y вверх), поэтому
-/// здесь Y инвертируется обратно перед вызовом `world_to_screen`.
-fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorShape, world_to_screen: &impl Fn(glam::Vec2) -> egui::Pos2) {
+/// здесь Y инвертируется обратно перед вызовом `world_to_screen`. `vector_doc`
+/// нужен только для резолва градиентов (`fill_gradient` ссылается на него по
+/// имени — раздел 60 ТЗ), фигура сама по себе доступа к документу не имеет.
+fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorShape, vector_doc: &pony_core::VectorDoc, world_to_screen: &impl Fn(glam::Vec2) -> egui::Pos2) {
     use pony_core::VectorShape;
     match shape {
-        VectorShape::Rect { x, y, w, h, fill, stroke, stroke_width } => {
-            let p0 = world_to_screen(glam::Vec2::new(*x, -*y));
-            let p1 = world_to_screen(glam::Vec2::new(x + w, -(y + h)));
-            let rect = egui::Rect::from_two_pos(p0, p1);
-            painter.rect(rect, 0.0, rgba_to_color32(*fill), egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke)));
+        VectorShape::Rect { x, y, w, h, fill, stroke, stroke_width, fill_gradient } => {
+            let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
+            // Раздел 60 ТЗ: заливка через собственный меш с per-vertex
+            // цветом на 4 углах — единственный способ показать НАСТОЯЩИЙ
+            // (не приближённый одним плоским цветом) градиент в egui,
+            // у которого `painter.rect` берёт только один цвет на всю
+            // фигуру. Обводка по-прежнему рисуется отдельным `rect_stroke`
+            // поверх — Rect не поддерживает градиентную обводку в этой
+            // версии (см. `VectorShape::set_fill_gradient` — только fill).
+            let corners_doc = [(*x, *y), (x + w, *y), (x + w, y + h), (*x, y + h)];
+            let corners_screen: Vec<egui::Pos2> = corners_doc.iter().map(|(cx, cy)| world_to_screen(glam::Vec2::new(*cx, -*cy))).collect();
+            let colors: Vec<egui::Color32> = corners_doc.iter().map(|(cx, cy)| color_at(*cx, *cy)).collect();
+            if let Some(mesh) = triangulate_fill(&corners_screen, &colors) {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            let rect = egui::Rect::from_two_pos(corners_screen[0], corners_screen[2]);
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke)));
         }
-        VectorShape::Ellipse { cx, cy, rx, ry: _ry, fill, stroke, stroke_width } => {
-            // Превью рисует круг (egui::Painter не даёт эллипс одной командой) —
-            // упрощение только для оверлея на Stage; сохранённый .svg честно
-            // хранит rx/ry раздельно и после сохранения через resvg
-            // рендерится настоящим эллипсом, без искажения.
-            let center = world_to_screen(glam::Vec2::new(*cx, -*cy));
-            let edge = world_to_screen(glam::Vec2::new(cx + rx, -*cy));
-            let r = (edge.x - center.x).abs();
-            painter.circle(center, r, rgba_to_color32(*fill), egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke)));
+        VectorShape::Ellipse { cx, cy, rx, ry, fill, stroke, stroke_width, fill_gradient } => {
+            // Превью аппроксимирует эллипс правильным N-угольником — точнее,
+            // чем прежний "рисуем круг радиуса rx" (который искажал форму
+            // при rx != ry) и единственный практичный способ дать per-vertex
+            // градиент по кругу в egui (нет отдельной команды "залитый
+            // эллипс с градиентом одной командой"). Сохранённый .svg честно
+            // хранит rx/ry и рендерится точным эллипсом через resvg — это
+            // ограничение только Stage-оверлея.
+            const SEGMENTS: usize = 32;
+            let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
+            let mut ring_doc: Vec<(f32, f32)> = Vec::with_capacity(SEGMENTS);
+            for i in 0..SEGMENTS {
+                let theta = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+                ring_doc.push((cx + rx * theta.cos(), cy + ry * theta.sin()));
+            }
+            let ring_screen: Vec<egui::Pos2> = ring_doc.iter().map(|(px, py)| world_to_screen(glam::Vec2::new(*px, -*py))).collect();
+            let ring_colors: Vec<egui::Color32> = ring_doc.iter().map(|(px, py)| color_at(*px, *py)).collect();
+            let center_screen = world_to_screen(glam::Vec2::new(*cx, -*cy));
+            let center_color = color_at(*cx, *cy);
+            let mut mesh = egui::epaint::Mesh::default();
+            mesh.vertices.push(egui::epaint::Vertex { pos: center_screen, uv: egui::Pos2::ZERO, color: center_color });
+            for (p, c) in ring_screen.iter().zip(ring_colors.iter()) {
+                mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv: egui::Pos2::ZERO, color: *c });
+            }
+            for i in 0..SEGMENTS as u32 {
+                let a = 1 + i;
+                let b = 1 + (i + 1) % SEGMENTS as u32;
+                mesh.indices.extend_from_slice(&[0, a, b]);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            painter.add(egui::Shape::closed_line(ring_screen, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
         }
         VectorShape::Line { x1, y1, x2, y2, stroke, stroke_width } => {
             let p0 = world_to_screen(glam::Vec2::new(*x1, -*y1));
@@ -791,52 +879,99 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             let screen_pts: Vec<egui::Pos2> = points.iter().map(|(x, y)| world_to_screen(glam::Vec2::new(*x, -*y))).collect();
             painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
         }
-        VectorShape::Polygon { points, fill, stroke, stroke_width } => {
-            // Честная оговорка: egui::Shape::convex_polygon корректно
-            // рисует только ВЫПУКЛЫЕ многоугольники — для PolyStar (всегда
-            // правильный n-угольник) это всегда так, но если Pen нарисует
-            // невыпуклую фигуру, ПРЕВЬЮ на Stage может исказиться. Сам
-            // сохранённый .svg при этом рисуется правильно в любом случае —
-            // это ограничение только egui-оверлея, не движка.
+        VectorShape::Polygon { points, fill, stroke, stroke_width, fill_gradient } => {
+            // Честная оговорка: собственная ear-clipping триангуляция (см.
+            // `triangulate_fill`) корректно рисует любой ПРОСТОЙ (без
+            // самопересечений) многоугольник, выпуклый или нет — раньше
+            // здесь был `egui::Shape::convex_polygon`, который для невыпуклых
+            // фигур мог исказить превью; теперь используется тот же путь,
+            // что и Path ниже, заодно даёт градиентную заливку бесплатно.
+            // Сохранённый .svg при этом всегда рисуется правильно — это
+            // ограничение затрагивало только Stage-оверлей.
+            let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
             let screen_pts: Vec<egui::Pos2> = points.iter().map(|(x, y)| world_to_screen(glam::Vec2::new(*x, -*y))).collect();
-            painter.add(egui::Shape::convex_polygon(screen_pts, rgba_to_color32(*fill), egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+            let colors: Vec<egui::Color32> = points.iter().map(|(x, y)| color_at(*x, *y)).collect();
+            if let Some(mesh) = triangulate_fill(&screen_pts, &colors) {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            painter.add(egui::Shape::closed_line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
         }
-        VectorShape::Path { nodes, closed, stroke, stroke_width, .. } => {
+        VectorShape::Path { nodes, closed, fill, stroke, stroke_width, fill_gradient } => {
             // Превью тесселирует каждый сегмент (прямой или кубическую
             // Безье) в ломаную из фиксированного числа отрезков — только
             // для оверлея на Stage. Сам сохранённый .svg хранит настоящие
             // C/L-команды и рендерится точной кривой через resvg, эта
-            // тесселяция никак на него не влияет. Заливка НЕ рисуется в
-            // превью (в отличие от Polygon) — у открытого/сложного path
-            // с самопересечениями "заливка по контуру" через
-            // convex_polygon дала бы неверную картинку чаще, чем
-            // правильную; обводка честно показывает форму в любом случае.
+            // тесселяция никак на него не влияет.
+            //
+            // Заливка: для замкнутого path с >=3 точками тесселированный
+            // контур триангулируется ear-clipping'ом (работает для любого
+            // ПРОСТОГО многоугольника — выпуклого или вогнутого, без
+            // самопересечений; ровно так же, как это делает resvg при
+            // финальном рендере). У путей с самопересечениями (редкость на
+            // практике — руками нарисовать сложно) заливка может визуально
+            // отличаться от финального .svg, но отсутствие заливки вообще
+            // (как было раньше) вводило в заблуждение сильнее в абсолютном
+            // большинстве реальных файлов — оба демо-ассета (tail/wing)
+            // используют обычные простые контуры. Раздел 60 ТЗ: каждая
+            // вершина тесселяции несёт СВОЙ document-space цвет — и прямой,
+            // и кривой сегмент дают достаточно плотную выборку вдоль
+            // контура, чтобы градиент выглядел гладким, не гранёным.
             const SEGMENTS: usize = 16;
             let mut screen_pts: Vec<egui::Pos2> = Vec::new();
+            let mut doc_pts: Vec<(f32, f32)> = Vec::new();
             if !nodes.is_empty() {
                 screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
+                doc_pts.push(nodes[0].position);
                 for i in 1..nodes.len() {
-                    tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts);
+                    tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
                 }
                 if *closed && nodes.len() > 1 {
-                    tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts);
+                    tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                }
+            }
+            if *closed && fill.a > 0 && screen_pts.len() >= 3 {
+                let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
+                let colors: Vec<egui::Color32> = doc_pts.iter().map(|(x, y)| color_at(*x, *y)).collect();
+                if let Some(mesh) = triangulate_fill(&screen_pts, &colors) {
+                    painter.add(egui::Shape::mesh(mesh));
                 }
             }
             painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+        }
+        VectorShape::Instance { .. } => {
+            // Никогда не должен дойти сюда: вызывающая сторона (см. цикл
+            // отрисовки `vector_doc.shapes` на Stage) резолвит Instance в
+            // конкретные фигуры символа ДО вызова этой функции — Instance
+            // сам по себе не знает, как выглядит геометрия, на которую
+            // ссылается, у него нет доступа к `VectorDoc::symbols` здесь.
+            debug_assert!(false, "draw_vector_shape_preview получил Instance напрямую — вызывающая сторона должна была резолвить его через resolve_symbol_instance");
         }
     }
 }
 
 /// Разбить один сегмент path (`from` -> `to`, кривая если у концов есть
 /// ручки, иначе прямая) на `SEGMENTS` отрезков через кубическую формулу
-/// Безье, добавляя экранные точки в `out` (первая точка сегмента уже есть
-/// в `out` от предыдущего вызова — добавляем только последующие).
-fn tessellate_segment(from: &pony_core::PathNode, to: &pony_core::PathNode, segments: usize, world_to_screen: &impl Fn(glam::Vec2) -> egui::Pos2, out: &mut Vec<egui::Pos2>) {
+/// Безье, добавляя экранные точки в `out_screen` (первая точка сегмента уже
+/// есть в обоих выходных векторах от предыдущего вызова — добавляем только
+/// последующие). `out_doc` — параллельный вектор ТЕХ ЖЕ точек в исходных
+/// document-space координатах (до Y-флипа/`world_to_screen`) — нужен раздел
+/// 60 ТЗ (Gradients): сэмплирование градиента идёт в document space,
+/// экранные координаты для этого не годятся (Stage может быть повёрнут/
+/// отмасштабирован/запанорамлен независимо от геометрии фигуры).
+fn tessellate_segment(
+    from: &pony_core::PathNode,
+    to: &pony_core::PathNode,
+    segments: usize,
+    world_to_screen: &impl Fn(glam::Vec2) -> egui::Pos2,
+    out_screen: &mut Vec<egui::Pos2>,
+    out_doc: &mut Vec<(f32, f32)>,
+) {
     let p0 = from.position;
     let p3 = to.position;
     match (from.out_handle, to.in_handle) {
         (None, None) => {
-            out.push(world_to_screen(glam::Vec2::new(p3.0, -p3.1)));
+            out_screen.push(world_to_screen(glam::Vec2::new(p3.0, -p3.1)));
+            out_doc.push(p3);
         }
         (out_h, in_h) => {
             let p1 = out_h.unwrap_or(p0);
@@ -846,10 +981,130 @@ fn tessellate_segment(from: &pony_core::PathNode, to: &pony_core::PathNode, segm
                 let mt = 1.0 - t;
                 let x = mt * mt * mt * p0.0 + 3.0 * mt * mt * t * p1.0 + 3.0 * mt * t * t * p2.0 + t * t * t * p3.0;
                 let y = mt * mt * mt * p0.1 + 3.0 * mt * mt * t * p1.1 + 3.0 * mt * t * t * p2.1 + t * t * t * p3.1;
-                out.push(world_to_screen(glam::Vec2::new(x, -y)));
+                out_screen.push(world_to_screen(glam::Vec2::new(x, -y)));
+                out_doc.push((x, y));
             }
         }
     }
+}
+
+/// Триангулирует замкнутый простой (без самопересечений) многоугольник
+/// методом ear clipping и возвращает готовый `egui::epaint::Mesh` для
+/// заливки — используется превью Rect/Polygon/Path на Stage (см.
+/// `draw_vector_shape_preview`). `colors[i]` — цвет вершины `points[i]`
+/// (та же длина, что и `points`) — раздел 60 ТЗ: per-vertex цвет, не один
+/// общий, чтобы градиентная заливка не сводилась к плоскому приближению.
+/// Возвращает `None`, если после дедупликации соседних совпадающих точек
+/// вершин осталось меньше 3 (вырожденный контур — рисовать нечего).
+fn triangulate_fill(points: &[egui::Pos2], colors: &[egui::Color32]) -> Option<egui::epaint::Mesh> {
+    debug_assert_eq!(points.len(), colors.len(), "triangulate_fill: points и colors должны быть одной длины");
+    // Убираем повторяющуюся последнюю точку, если тесселяция дала её
+    // совпадающей с первой (замкнутый контур), и вообще любые соседние
+    // дубликаты — ear clipping ломается на нулевых по площади треугольниках.
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(points.len());
+    let mut cols: Vec<egui::Color32> = Vec::with_capacity(points.len());
+    for (i, &p) in points.iter().enumerate() {
+        if pts.last().map_or(true, |last: &egui::Pos2| (*last - p).length_sq() > 1e-8) {
+            pts.push(p);
+            cols.push(colors.get(i).copied().unwrap_or(egui::Color32::WHITE));
+        }
+    }
+    if pts.len() >= 2 && (pts[0] - *pts.last().unwrap()).length_sq() <= 1e-8 {
+        pts.pop();
+        cols.pop();
+    }
+    if pts.len() < 3 {
+        return None;
+    }
+
+    // Знаковая площадь определяет обход (CW/CCW) — ear clipping ниже
+    // проверяет "выпуклость уха" через знак векторного произведения и
+    // должен знать ориентацию контура, иначе выберет уши с обратной стороны.
+    let signed_area: f32 = {
+        let mut sum = 0.0;
+        for i in 0..pts.len() {
+            let a = pts[i];
+            let b = pts[(i + 1) % pts.len()];
+            sum += a.x * b.y - b.x * a.y;
+        }
+        sum * 0.5
+    };
+    let ccw = signed_area > 0.0;
+
+    let cross = |o: egui::Pos2, a: egui::Pos2, b: egui::Pos2| -> f32 { (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x) };
+
+    let point_in_triangle = |p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| -> bool {
+        let d1 = cross(a, b, p);
+        let d2 = cross(b, c, p);
+        let d3 = cross(c, a, p);
+        let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(has_neg && has_pos)
+    };
+
+    let mut indices: Vec<u32> = (0..pts.len() as u32).collect();
+    let mut triangles: Vec<[u32; 3]> = Vec::with_capacity(pts.len().saturating_sub(2));
+    // Защита от бесконечного цикла на вырожденных/самопересекающихся
+    // контурах, где ни одно "ухо" не находится: ограничиваем число попыток
+    // и, если триангуляция застряла, отдаём то, что успели собрать (лучше
+    // частичная заливка, чем зависание кадра).
+    let mut guard = indices.len() * indices.len() + 8;
+    while indices.len() > 3 && guard > 0 {
+        guard -= 1;
+        let n = indices.len();
+        let mut ear_found = false;
+        for i in 0..n {
+            let i_prev = (i + n - 1) % n;
+            let i_next = (i + 1) % n;
+            let a = pts[indices[i_prev] as usize];
+            let b = pts[indices[i] as usize];
+            let c = pts[indices[i_next] as usize];
+            let cr = cross(a, b, c);
+            let is_convex = if ccw { cr > 0.0 } else { cr < 0.0 };
+            if !is_convex {
+                continue;
+            }
+            let mut any_inside = false;
+            for &idx in &indices {
+                if idx == indices[i_prev] || idx == indices[i] || idx == indices[i_next] {
+                    continue;
+                }
+                if point_in_triangle(pts[idx as usize], a, b, c) {
+                    any_inside = true;
+                    break;
+                }
+            }
+            if any_inside {
+                continue;
+            }
+            triangles.push([indices[i_prev], indices[i], indices[i_next]]);
+            indices.remove(i);
+            ear_found = true;
+            break;
+        }
+        if !ear_found {
+            // Не нашли валидное ухо (самопересекающийся контур) — обрываем
+            // триангуляцию тем, что уже накопили, вместо зависания.
+            break;
+        }
+    }
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    }
+    if triangles.is_empty() {
+        return None;
+    }
+
+    let mut mesh = egui::epaint::Mesh::default();
+    for (i, &p) in pts.iter().enumerate() {
+        mesh.vertices.push(egui::epaint::Vertex { pos: p, uv: egui::Pos2::new(0.0, 0.0), color: cols[i] });
+    }
+    for tri in triangles {
+        mesh.indices.push(tri[0]);
+        mesh.indices.push(tri[1]);
+        mesh.indices.push(tri[2]);
+    }
+    Some(mesh)
 }
 
 const EXPORT_FPS: f32 = 24.0;
@@ -1089,10 +1344,56 @@ fn main() {
     let mut bone_rename_buf = String::new();
     let mut bone_count: u32 = 0;
 
+    // --- IK (раздел 41 ТЗ): состояние формы создания нового констрейнта
+    // и отложенное удаление (нельзя мутировать character.skeleton.
+    // ik_constraints, пока по нему же идёт итерация в блоке ui выше). ---
+    let mut ik_new_root: Option<String> = None;
+    let mut ik_new_mid: Option<String> = None;
+    let mut ik_new_tip: Option<String> = None;
+    let mut ik_to_remove: Option<String> = None;
+
     // --- SubSelection: редактирование точек уже нарисованной (ещё не
     // сохранённой как часть) фигуры на холсте ---
     let mut selected_shape_index: Option<usize> = None;
     let mut dragging_point_index: Option<usize> = None;
+
+    // --- Symbols (раздел 28 + 95 ТЗ): имя для нового Symbol Definition при
+    // "Convert to Symbol" — отдельный текстовый буфер ввода на вкладке
+    // Symbols, тот же приём, что и `bone_rename_buf` у костей. ---
+    let mut symbol_name_buf = String::new();
+
+    // --- Gradients (раздел 60 ТЗ): форма редактирования одного
+    // GradientDef за раз — те же поля, что у GradientDef/GradientKind в
+    // pony-core, плюс `gradient_editing_existing`, которое отличает "новый
+    // градиент" (None — "Сохранить" создаёт новую запись) от "правим уже
+    // существующий" (Some(name) — "Сохранить" делает upsert под тем же
+    // именем, обновляя все фигуры, которые на него ссылаются). Кнопка
+    // "Загрузить в форму" на карточке в списке заполняет эти поля из
+    // выбранного GradientDef, тем же приёмом, что redo/undo не нужен —
+    // сама форма не мутирует документ, пока не нажат "Сохранить".
+    let mut gradient_editing_existing: Option<String> = None;
+    let mut gradient_name_buf = String::new();
+    let mut gradient_is_radial = false;
+    let mut gradient_lin_x1: f32 = 0.0;
+    let mut gradient_lin_y1: f32 = 0.0;
+    let mut gradient_lin_x2: f32 = 100.0;
+    let mut gradient_lin_y2: f32 = 0.0;
+    let mut gradient_rad_cx: f32 = 50.0;
+    let mut gradient_rad_cy: f32 = 50.0;
+    let mut gradient_rad_r: f32 = 50.0;
+    let mut gradient_stops: Vec<pony_core::GradientStop> = vec![
+        pony_core::GradientStop { offset: 0.0, color: pony_core::RgbaColor::new(255, 255, 255, 255) },
+        pony_core::GradientStop { offset: 1.0, color: pony_core::RgbaColor::new(0, 0, 0, 255) },
+    ];
+
+    // --- Boolean / Combine Paths (раздел 44 ТЗ, меню Modify): индексы
+    // выбранных "верхней"/"нижней" фигур в vector_doc.shapes и текущая
+    // операция — форма на вкладке Boolean, тот же приём, что и у формы
+    // Gradients выше (панель не мутирует документ, пока не нажата кнопка
+    // "Выполнить"). ---
+    let mut boolean_front_idx: Option<usize> = None;
+    let mut boolean_back_idx: Option<usize> = None;
+    let mut boolean_op_kind = pony_core::BooleanOp::Union;
 
     // --- Lasso: рамкой выделить несколько частей персонажа сразу, для
     // групповых операций (скрыть/показать/удалить группой) ---
@@ -1203,7 +1504,13 @@ fn main() {
                             // случаях рендерим каждый кадр, как и раньше, без исключений.
                             if !was_dragging_shape_last_frame {
                                 let mut visible_character = character.clone();
-                                visible_character.parts.retain(|id, _| !hidden_layers.contains(id));
+                                // Часть скрыта, если скрыта ОНА САМА (hidden_layers,
+                                // раньше единственный механизм) ИЛИ группа, в которую
+                                // она входит — включая скрытие любого родителя этой
+                                // группы по цепочке (раздел 27 ТЗ: скрытие группы
+                                // должно скрывать всё вложенное дерево целиком, см.
+                                // `Character::is_part_hidden_by_group`).
+                                visible_character.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
                                 let particles_arg = if particles_enabled { Some(&particle_emitter) } else { None };
                                 let rendered = pony_renderer.render_character(
                                     &gpu_ctx,
@@ -1415,6 +1722,20 @@ fn main() {
                                                     ui.close_menu();
                                                 }
                                                 if ui.button("Снять групповое выделение").clicked() {
+                                                    multi_selected.clear();
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                // Раздел 27/44 ТЗ ("Group" в меню Modify) — превратить
+                                                // ЭФЕМЕРНОЕ Lasso-выделение (`multi_selected`, живёт
+                                                // только пока не снято/не заменено) в ПОСТОЯННУЮ
+                                                // группу (`Character::groups`, переживает сохранение
+                                                // .asset) — та же организационная роль, что `<g>` в SVG.
+                                                if ui.button("Group (создать постоянную группу)").clicked() {
+                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                    let ids: Vec<String> = multi_selected.iter().cloned().collect();
+                                                    let group_id = character.group_parts(format!("Group {}", character.groups.groups.len() + 1), &ids);
+                                                    status_message = format!("Группа '{group_id}' создана из {} частей", ids.len());
                                                     multi_selected.clear();
                                                     ui.close_menu();
                                                 }
@@ -1881,6 +2202,10 @@ fn main() {
                                                 RightTab::Particles,
                                                 RightTab::Bones,
                                                 RightTab::SvgInspector,
+                                                RightTab::Symbols,
+                                                RightTab::Groups,
+                                                RightTab::Gradients,
+                                                RightTab::Boolean,
                                             ] {
                                                 if ui.selectable_label(right_tab == tab, tab.label()).clicked() {
                                                     right_tab = tab;
@@ -1986,6 +2311,53 @@ fn main() {
                                                                 p.layer = layer;
                                                             }
                                                         }
+
+                                                        // Маска/Clipping (раздел 60 ТЗ) — часть.clip_by
+                                                        // ссылается на ДРУГУЮ часть этого же
+                                                        // персонажа, чья альфа режет альфу текущей
+                                                        // части (растровая маска, как маскирующий
+                                                        // слой в Adobe Animate). Сама часть-маска
+                                                        // из этого списка исключена (нельзя
+                                                        // назначить саму себя — resolve_clip_mask
+                                                        // всё равно бы это отверг на рендере, но
+                                                        // честнее не предлагать такой вариант в UI
+                                                        // вообще), а части, УЖЕ являющиеся чьей-то
+                                                        // маской (`clip_by.is_some()` у самих себя
+                                                        // не проверяем — проверяем, что цепочка не
+                                                        // получится глубже одного уровня, как и в
+                                                        // resolve_clip_mask) — тоже исключены, чтобы
+                                                        // не предлагать в UI комбинацию, которую
+                                                        // рендер всё равно проигнорирует.
+                                                        ui.separator();
+                                                        let current_mask = part.clip_by.clone().unwrap_or_else(|| "(нет)".into());
+                                                        let mut new_mask: Option<Option<String>> = None;
+                                                        egui::ComboBox::from_label("Маска (Clip by)").selected_text(&current_mask).show_ui(ui, |ui| {
+                                                            if ui.selectable_label(part.clip_by.is_none(), "(нет)").clicked() {
+                                                                new_mask = Some(None);
+                                                            }
+                                                            for other in character.parts.values() {
+                                                                if other.id == id || other.clip_by.is_some() {
+                                                                    continue;
+                                                                }
+                                                                if ui.selectable_label(part.clip_by.as_deref() == Some(other.id.as_str()), &other.id).clicked() {
+                                                                    new_mask = Some(Some(other.id.clone()));
+                                                                }
+                                                            }
+                                                        });
+                                                        if let Some(target_mask) = new_mask {
+                                                            if target_mask != part.clip_by {
+                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                                if let Some(p) = character.parts.get_mut(&id) {
+                                                                    p.clip_by = target_mask.clone();
+                                                                }
+                                                                status_message = match &target_mask {
+                                                                    Some(m) => format!("'{id}' теперь маскируется частью '{m}'"),
+                                                                    None => format!("'{id}': маска снята"),
+                                                                };
+                                                            }
+                                                        }
+                                                        ui.small("Маска обрезает альфу по форме выбранной части. Часть-маска сама продолжает рисоваться как обычно.");
+
                                                         ui.small("Инструмент Sel: клик — выбрать, перетаскивание — двигать саму часть.");
                                                         ui.small("Инструмент Xform: двигает кость (и всё, что к ней прикреплено).");
                                                     }
@@ -2287,6 +2659,95 @@ fn main() {
                                                         ui.label("(кость не выбрана)");
                                                     }
                                                 }
+
+                                                // IK (раздел 41 ТЗ): Two Bone IK-констрейнты. Раньше
+                                                // риггинг был только прямой (FK) — этот блок закрывает
+                                                // крупнейший пробел, отмеченный в README ("риггинг без
+                                                // инверсной кинематики"). Управляет тем же
+                                                // `Skeleton::ik_constraints`, что реально читает
+                                                // рендер (`world_transform_with_ik` в pony-render) —
+                                                // не косметическая панель, двигает персонажа взаправду.
+                                                ui.separator();
+                                                ui.collapsing("IK (Two Bone)", |ui| {
+                                                    ui.small("Раздел 41 ТЗ: цепочка Root->Mid->Tip тянется к точке Target. Пример: Hip->Knee->Hoof.");
+                                                    let ik_ids: Vec<String> = character.skeleton.ik_constraints.iter().map(|c| c.id.clone()).collect();
+                                                    for ik_id in &ik_ids {
+                                                        let Some(idx) = character.skeleton.ik_constraints.iter().position(|c| &c.id == ik_id) else { continue };
+                                                        ui.group(|ui| {
+                                                            let constraint = &mut character.skeleton.ik_constraints[idx];
+                                                            ui.horizontal(|ui| {
+                                                                ui.strong(&constraint.id);
+                                                                ui.checkbox(&mut constraint.enabled, "включен");
+                                                            });
+                                                            ui.small(format!("{} -> {} -> {}", constraint.root, constraint.mid, constraint.tip));
+                                                            ui.add(egui::DragValue::new(&mut constraint.target.x).prefix("Target X: ").speed(0.5));
+                                                            ui.add(egui::DragValue::new(&mut constraint.target.y).prefix("Target Y: ").speed(0.5));
+                                                            ui.add(egui::Slider::new(&mut constraint.weight, 0.0..=1.0).text("Weight"));
+
+                                                            let mut has_pole = constraint.pole_target.is_some();
+                                                            if ui.checkbox(&mut has_pole, "Pole Target").changed() {
+                                                                constraint.pole_target = if has_pole { Some(constraint.target + glam::Vec2::new(0.0, 20.0)) } else { None };
+                                                            }
+                                                            if let Some(pole) = constraint.pole_target.as_mut() {
+                                                                ui.add(egui::DragValue::new(&mut pole.x).prefix("Pole X: ").speed(0.5));
+                                                                ui.add(egui::DragValue::new(&mut pole.y).prefix("Pole Y: ").speed(0.5));
+                                                            }
+                                                            if ui.button("Удалить IK").clicked() {
+                                                                ik_to_remove = Some(constraint.id.clone());
+                                                            }
+                                                        });
+                                                    }
+
+                                                    ui.separator();
+                                                    ui.label("Новый IK-констрейнт:");
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Root:");
+                                                        egui::ComboBox::from_id_source("ik_new_root").selected_text(ik_new_root.clone().unwrap_or_else(|| "-".into())).show_ui(ui, |ui| {
+                                                            for b in &character.skeleton.bones {
+                                                                if ui.selectable_label(ik_new_root.as_deref() == Some(b.id.as_str()), &b.id).clicked() {
+                                                                    ik_new_root = Some(b.id.clone());
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Mid:");
+                                                        egui::ComboBox::from_id_source("ik_new_mid").selected_text(ik_new_mid.clone().unwrap_or_else(|| "-".into())).show_ui(ui, |ui| {
+                                                            for b in &character.skeleton.bones {
+                                                                if ui.selectable_label(ik_new_mid.as_deref() == Some(b.id.as_str()), &b.id).clicked() {
+                                                                    ik_new_mid = Some(b.id.clone());
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Tip:");
+                                                        egui::ComboBox::from_id_source("ik_new_tip").selected_text(ik_new_tip.clone().unwrap_or_else(|| "-".into())).show_ui(ui, |ui| {
+                                                            for b in &character.skeleton.bones {
+                                                                if ui.selectable_label(ik_new_tip.as_deref() == Some(b.id.as_str()), &b.id).clicked() {
+                                                                    ik_new_tip = Some(b.id.clone());
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                    let can_create = ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some();
+                                                    if ui.add_enabled(can_create, egui::Button::new("+ Создать IK-констрейнт")).clicked() {
+                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                        let (root, mid, tip) = (ik_new_root.take().unwrap(), ik_new_mid.take().unwrap(), ik_new_tip.take().unwrap());
+                                                        let tip_world = character.skeleton.world_transform(&tip).unwrap_or_default();
+                                                        let mut constraint = pony_core::IkConstraint::new(format!("ik_{}", character.skeleton.ik_constraints.len() + 1), root, mid, tip);
+                                                        // Target по умолчанию — текущая мировая позиция tip
+                                                        // (нога не дёргается в момент создания констрейнта).
+                                                        constraint.target = tip_world.position;
+                                                        character.skeleton.add_ik_constraint(constraint);
+                                                        status_message = "IK-констрейнт создан".into();
+                                                    }
+                                                });
+                                                if let Some(id) = ik_to_remove.take() {
+                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                    character.skeleton.remove_ik_constraint(&id);
+                                                    status_message = format!("IK-констрейнт '{id}' удалён");
+                                                }
                                             }
                                             // SVG Inspector (раздел 79 ТЗ) — специальная панель:
                                             // список ВСЕХ SVG-частей персонажа сразу, а не только
@@ -2337,6 +2798,418 @@ fn main() {
                                                             });
                                                         }
                                                     });
+                                                }
+                                            }
+                                            RightTab::Symbols => {
+                                                ui.small("Раздел 28 ТЗ (\"Symbol — reusable object\") + раздел 95 (\"Symbol instance overrides\"): переиспользуемые объекты — правка определения сразу отражается на всех инстансах.");
+                                                ui.separator();
+
+                                                ui.label("Convert to Symbol");
+                                                ui.horizontal(|ui| {
+                                                    ui.text_edit_singleline(&mut symbol_name_buf);
+                                                    let can_convert = selected_shape_index.map(|i| !matches!(vector_doc.shapes.get(i), Some(pony_core::VectorShape::Instance { .. }) | None)).unwrap_or(false);
+                                                    if ui.add_enabled(can_convert && !symbol_name_buf.trim().is_empty(), egui::Button::new("Создать из выбранной фигуры")).clicked() {
+                                                        if let Some(idx) = selected_shape_index {
+                                                            if let Some(shape) = vector_doc.shapes.get(idx).cloned() {
+                                                                let name = symbol_name_buf.trim().to_string();
+                                                                vector_doc.upsert_symbol(name.clone(), vec![shape]);
+                                                                // Раздел 28: исходная фигура на холсте заменяется
+                                                                // инстансом нового символа (сама геометрия теперь
+                                                                // живёт в SymbolDef, не дублируется на холсте) —
+                                                                // identity-transform, т.к. фигура уже была в
+                                                                // абсолютных координатах документа.
+                                                                vector_doc.shapes[idx] = pony_core::VectorShape::Instance { symbol: name.clone(), transform: (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), fill_override: None };
+                                                                status_message = format!("Символ '{name}' создан, фигура заменена на инстанс");
+                                                                symbol_name_buf.clear();
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                                if selected_shape_index.is_none() {
+                                                    ui.small("Выбери фигуру инструментом SubSelection на холсте, чтобы превратить её в символ.");
+                                                }
+                                                ui.separator();
+
+                                                if vector_doc.symbols.is_empty() {
+                                                    ui.label("Пока нет ни одного символа в этом документе.");
+                                                } else {
+                                                    ui.label(format!("Определения символов: {}", vector_doc.symbols.len()));
+                                                    let mut place_instance: Option<String> = None;
+                                                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                                        for def in &vector_doc.symbols {
+                                                            ui.group(|ui| {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.strong(&def.name);
+                                                                    ui.weak(format!("{} фигур(ы)", def.shapes.len()));
+                                                                });
+                                                                let instance_count = vector_doc.shapes.iter().filter(|s| matches!(s, pony_core::VectorShape::Instance { symbol, .. } if symbol == &def.name)).count();
+                                                                ui.small(format!("Инстансов на холсте: {instance_count}"));
+                                                                if ui.button("+ Разместить инстанс в центре").clicked() {
+                                                                    place_instance = Some(def.name.clone());
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                    if let Some(name) = place_instance {
+                                                        // Центр текущего viewBox документа — разумная точка
+                                                        // по умолчанию, дальше инстанс двигается как обычная
+                                                        // фигура (единственный control point — точка
+                                                        // переноса, см. VectorShape::control_points).
+                                                        let (min_x, min_y, max_x, max_y) = vector_doc.bounds().unwrap_or((0.0, 0.0, 100.0, 100.0));
+                                                        let center = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+                                                        if let Some(inst) = vector_doc.new_instance_centered_at(&name, center.0, center.1) {
+                                                            vector_doc.add(inst);
+                                                            selected_shape_index = Some(vector_doc.shapes.len() - 1);
+                                                            active_tool = Tool::SubSelection;
+                                                            status_message = format!("Инстанс символа '{name}' размещён");
+                                                        }
+                                                    }
+                                                }
+                                                ui.separator();
+
+                                                let selected_is_instance = selected_shape_index.and_then(|i| vector_doc.shapes.get(i)).map(|s| matches!(s, pony_core::VectorShape::Instance { .. })).unwrap_or(false);
+                                                if selected_is_instance {
+                                                    ui.label("Выбранная фигура — Symbol Instance.");
+                                                    if ui.button("Break Apart Symbol (разорвать связь)").clicked() {
+                                                        if let Some(idx) = selected_shape_index {
+                                                            if vector_doc.break_apart_symbol_instance(idx) {
+                                                                status_message = "Инстанс разорван — теперь независимая копия геометрии".into();
+                                                            }
+                                                        }
+                                                    }
+                                                    ui.small("Раздел 95 ТЗ: после разрыва фигура(ы) больше не связаны с Symbol Definition — правка определения на них не влияет.");
+                                                }
+                                            }
+                                            RightTab::Groups => {
+                                                ui.small("Раздел 27 ТЗ (\"g является контейнером и может содержать другие g на произвольной глубине\"): организационные группы поверх частей персонажа — независимы от того, к какой кости каждая часть привязана.");
+                                                ui.separator();
+
+                                                if character.groups.groups.is_empty() {
+                                                    ui.label("Пока нет ни одной группы.");
+                                                    ui.small("Лассо выдели несколько частей на Stage, затем Edit -> Group (создать постоянную группу).");
+                                                } else {
+                                                    let mut ungroup_id: Option<String> = None;
+                                                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                                                        // Сначала группы верхнего уровня, потом их дети — простой
+                                                        // способ показать иерархию без полноценного дерева виджетов:
+                                                        // отступ по глубине вложенности через `ui.indent`.
+                                                        fn draw_group_and_children(
+                                                            ui: &mut egui::Ui,
+                                                            character: &mut pony_core::Character,
+                                                            group_id: &str,
+                                                            ungroup_id: &mut Option<String>,
+                                                            depth: usize,
+                                                        ) {
+                                                            let Some(group) = character.groups.find(group_id).cloned() else { return };
+                                                            let member_count = character.parts.values().filter(|p| p.group.as_deref() == Some(group_id)).count();
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(depth as f32 * 16.0);
+                                                                ui.strong(&group.name);
+                                                                ui.weak(format!("({member_count} частей)"));
+                                                            });
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(depth as f32 * 16.0);
+                                                                let mut hidden = group.hidden;
+                                                                if ui.checkbox(&mut hidden, "Скрыта").changed() {
+                                                                    if let Some(g) = character.groups.find_mut(group_id) {
+                                                                        g.hidden = hidden;
+                                                                    }
+                                                                }
+                                                                if ui.button("Ungroup").clicked() {
+                                                                    *ungroup_id = Some(group_id.to_string());
+                                                                }
+                                                            });
+                                                            let children: Vec<String> = character.groups.groups.iter().filter(|g| g.parent.as_deref() == Some(group_id)).map(|g| g.id.clone()).collect();
+                                                            for child_id in children {
+                                                                draw_group_and_children(ui, character, &child_id, ungroup_id, depth + 1);
+                                                            }
+                                                        }
+                                                        let top_level: Vec<String> = character.groups.groups.iter().filter(|g| g.parent.is_none()).map(|g| g.id.clone()).collect();
+                                                        for group_id in top_level {
+                                                            ui.group(|ui| {
+                                                                draw_group_and_children(ui, &mut character, &group_id, &mut ungroup_id, 0);
+                                                            });
+                                                        }
+                                                    });
+                                                    if let Some(id) = ungroup_id {
+                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                        character.ungroup(&id);
+                                                        status_message = "Группа разгруппирована — части остались на месте".into();
+                                                    }
+                                                }
+                                            }
+                                            RightTab::Gradients => {
+                                                ui.small("Раздел 60 ТЗ (Gradients): именованные линейные и радиальные градиенты с произвольным числом цветовых остановок. Правка уже существующего градиента здесь сразу отражается на всех фигурах, которые ссылаются на него по имени (см. VectorDoc::upsert_gradient).");
+                                                ui.separator();
+
+                                                ui.label(match &gradient_editing_existing {
+                                                    Some(name) => format!("Редактирование градиента '{name}':"),
+                                                    None => "Новый градиент:".to_string(),
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Имя:");
+                                                    ui.text_edit_singleline(&mut gradient_name_buf);
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.selectable_value(&mut gradient_is_radial, false, "Linear");
+                                                    ui.selectable_value(&mut gradient_is_radial, true, "Radial");
+                                                });
+                                                if gradient_is_radial {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Центр:");
+                                                        ui.add(egui::DragValue::new(&mut gradient_rad_cx).prefix("X: ").speed(1.0));
+                                                        ui.add(egui::DragValue::new(&mut gradient_rad_cy).prefix("Y: ").speed(1.0));
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Радиус:");
+                                                        ui.add(egui::DragValue::new(&mut gradient_rad_r).speed(1.0).clamp_range(0.01..=100000.0));
+                                                    });
+                                                } else {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Точка 1:");
+                                                        ui.add(egui::DragValue::new(&mut gradient_lin_x1).prefix("X: ").speed(1.0));
+                                                        ui.add(egui::DragValue::new(&mut gradient_lin_y1).prefix("Y: ").speed(1.0));
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Точка 2:");
+                                                        ui.add(egui::DragValue::new(&mut gradient_lin_x2).prefix("X: ").speed(1.0));
+                                                        ui.add(egui::DragValue::new(&mut gradient_lin_y2).prefix("Y: ").speed(1.0));
+                                                    });
+                                                }
+                                                ui.separator();
+                                                ui.label(format!("Остановки цвета ({}):", gradient_stops.len()));
+                                                let stops_len = gradient_stops.len();
+                                                let mut remove_stop: Option<usize> = None;
+                                                for (i, stop) in gradient_stops.iter_mut().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(egui::DragValue::new(&mut stop.offset).speed(0.01).clamp_range(0.0..=1.0).prefix("offset: "));
+                                                        let mut c = rgba_to_color32(stop.color);
+                                                        if ui.color_edit_button_srgba(&mut c).changed() {
+                                                            stop.color = color32_to_rgba(c);
+                                                        }
+                                                        if ui.add_enabled(stops_len > 1, egui::Button::new("✕")).clicked() {
+                                                            remove_stop = Some(i);
+                                                        }
+                                                    });
+                                                }
+                                                if let Some(i) = remove_stop {
+                                                    gradient_stops.remove(i);
+                                                }
+                                                if ui.button("+ Добавить остановку").clicked() {
+                                                    let offset = gradient_stops.last().map(|s| (s.offset + 1.0) / 2.0).unwrap_or(0.5).clamp(0.0, 1.0);
+                                                    gradient_stops.push(pony_core::GradientStop { offset, color: pony_core::RgbaColor::new(128, 128, 128, 255) });
+                                                }
+                                                ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    let can_save = !gradient_name_buf.trim().is_empty() && !gradient_stops.is_empty();
+                                                    if ui.add_enabled(can_save, egui::Button::new("💾 Сохранить градиент")).clicked() {
+                                                        let kind = if gradient_is_radial {
+                                                            pony_core::GradientKind::Radial { cx: gradient_rad_cx, cy: gradient_rad_cy, r: gradient_rad_r }
+                                                        } else {
+                                                            pony_core::GradientKind::Linear { x1: gradient_lin_x1, y1: gradient_lin_y1, x2: gradient_lin_x2, y2: gradient_lin_y2 }
+                                                        };
+                                                        let name = gradient_name_buf.trim().to_string();
+                                                        vector_doc.upsert_gradient(pony_core::GradientDef::new(name.clone(), kind, gradient_stops.clone()));
+                                                        // Обновить fill-плейсхолдер у всех фигур, ссылающихся на
+                                                        // этот градиент по имени (в т.ч. если правили уже
+                                                        // существующий) — та же пост-обработка, что делает
+                                                        // from_svg_str после парсинга.
+                                                        vector_doc.sync_gradient_fallback_colors();
+                                                        status_message = format!("Градиент '{name}' сохранён");
+                                                        gradient_editing_existing = Some(name);
+                                                    }
+                                                    if ui.button("Новый (очистить форму)").clicked() {
+                                                        gradient_editing_existing = None;
+                                                        gradient_name_buf.clear();
+                                                        gradient_is_radial = false;
+                                                        gradient_lin_x1 = 0.0;
+                                                        gradient_lin_y1 = 0.0;
+                                                        gradient_lin_x2 = 100.0;
+                                                        gradient_lin_y2 = 0.0;
+                                                        gradient_rad_cx = 50.0;
+                                                        gradient_rad_cy = 50.0;
+                                                        gradient_rad_r = 50.0;
+                                                        gradient_stops = vec![
+                                                            pony_core::GradientStop { offset: 0.0, color: pony_core::RgbaColor::new(255, 255, 255, 255) },
+                                                            pony_core::GradientStop { offset: 1.0, color: pony_core::RgbaColor::new(0, 0, 0, 255) },
+                                                        ];
+                                                    }
+                                                });
+                                                ui.separator();
+
+                                                let mut load_into_form: Option<String> = None;
+                                                let mut delete_gradient: Option<String> = None;
+                                                let mut apply_to_selected: Option<String> = None;
+                                                if vector_doc.gradients.is_empty() {
+                                                    ui.label("Пока нет ни одного градиента в этом документе.");
+                                                } else {
+                                                    ui.label(format!("Определения градиентов: {}", vector_doc.gradients.len()));
+                                                    egui::ScrollArea::vertical().max_height(260.0).id_source("gradients_list").show(ui, |ui| {
+                                                        for def in &vector_doc.gradients {
+                                                            ui.group(|ui| {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.strong(&def.name);
+                                                                    ui.weak(match def.kind {
+                                                                        pony_core::GradientKind::Linear { .. } => "Linear",
+                                                                        pony_core::GradientKind::Radial { .. } => "Radial",
+                                                                    });
+                                                                    ui.weak(format!("{} стопов", def.stops.len()));
+                                                                });
+                                                                ui.horizontal(|ui| {
+                                                                    if ui.button("Загрузить в форму").clicked() {
+                                                                        load_into_form = Some(def.name.clone());
+                                                                    }
+                                                                    if ui.button("Удалить").clicked() {
+                                                                        delete_gradient = Some(def.name.clone());
+                                                                    }
+                                                                    let can_apply = selected_shape_index
+                                                                        .and_then(|i| vector_doc.shapes.get(i))
+                                                                        .map(|s| !matches!(s, pony_core::VectorShape::Instance { .. } | pony_core::VectorShape::Line { .. } | pony_core::VectorShape::Polyline { .. }))
+                                                                        .unwrap_or(false);
+                                                                    if ui.add_enabled(can_apply, egui::Button::new("Применить к выбранной фигуре")).clicked() {
+                                                                        apply_to_selected = Some(def.name.clone());
+                                                                    }
+                                                                });
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                                if selected_shape_index.is_none() {
+                                                    ui.small("Выбери фигуру инструментом SubSelection на холсте, чтобы применить к ней градиент.");
+                                                }
+
+                                                if let Some(name) = load_into_form {
+                                                    if let Some(def) = vector_doc.find_gradient(&name) {
+                                                        gradient_name_buf = def.name.clone();
+                                                        match def.kind {
+                                                            pony_core::GradientKind::Linear { x1, y1, x2, y2 } => {
+                                                                gradient_is_radial = false;
+                                                                gradient_lin_x1 = x1;
+                                                                gradient_lin_y1 = y1;
+                                                                gradient_lin_x2 = x2;
+                                                                gradient_lin_y2 = y2;
+                                                            }
+                                                            pony_core::GradientKind::Radial { cx, cy, r } => {
+                                                                gradient_is_radial = true;
+                                                                gradient_rad_cx = cx;
+                                                                gradient_rad_cy = cy;
+                                                                gradient_rad_r = r;
+                                                            }
+                                                        }
+                                                        gradient_stops = def.stops.clone();
+                                                        gradient_editing_existing = Some(name.clone());
+                                                        status_message = format!("Градиент '{name}' загружен в форму для редактирования");
+                                                    }
+                                                }
+                                                if let Some(name) = delete_gradient {
+                                                    vector_doc.remove_gradient(&name);
+                                                    if gradient_editing_existing.as_deref() == Some(name.as_str()) {
+                                                        gradient_editing_existing = None;
+                                                    }
+                                                    status_message = format!("Градиент '{name}' удалён (фигуры, ссылавшиеся на него, откатились на плоский fill)");
+                                                }
+                                                if let Some(name) = apply_to_selected {
+                                                    if let Some(idx) = selected_shape_index {
+                                                        if let Some(def) = vector_doc.find_gradient(&name).cloned() {
+                                                            let avg = def.average_color();
+                                                            if let Some(shape) = vector_doc.shapes.get_mut(idx) {
+                                                                shape.set_fill_gradient(Some(name.clone()), avg);
+                                                                status_message = format!("Градиент '{name}' применён к выбранной фигуре");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            RightTab::Boolean => {
+                                                ui.small("Раздел 44 ТЗ (Modify -> \"Combine Paths\"): Union/Difference/Intersection/XOR/Divide между двумя фигурами документа. Обе исходные фигуры заменяются результатом (одним или несколькими новыми Polygon) — не восстанавливаются.");
+                                                ui.separator();
+
+                                                let candidates: Vec<(usize, String)> = vector_doc
+                                                    .shapes
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(_, s)| pony_core::flatten_shape_to_contour(s).is_some())
+                                                    .map(|(i, s)| (i, format!("#{i} {}", shape_kind_label(s))))
+                                                    .collect();
+
+                                                if candidates.len() < 2 {
+                                                    ui.label("Нужно минимум 2 подходящие фигуры на холсте (Rect/Ellipse/Polygon/замкнутый Path — не Line/Polyline/Instance).");
+                                                } else {
+                                                    let front_label = boolean_front_idx.and_then(|i| candidates.iter().find(|(ci, _)| *ci == i)).map(|(_, l)| l.clone()).unwrap_or_else(|| "-".to_string());
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Верхняя фигура (front):");
+                                                        egui::ComboBox::from_id_source("boolean_front").selected_text(front_label).show_ui(ui, |ui| {
+                                                            for (i, label) in &candidates {
+                                                                ui.selectable_value(&mut boolean_front_idx, Some(*i), label);
+                                                            }
+                                                        });
+                                                    });
+                                                    let back_label = boolean_back_idx.and_then(|i| candidates.iter().find(|(ci, _)| *ci == i)).map(|(_, l)| l.clone()).unwrap_or_else(|| "-".to_string());
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Нижняя фигура (back):");
+                                                        egui::ComboBox::from_id_source("boolean_back").selected_text(back_label).show_ui(ui, |ui| {
+                                                            for (i, label) in &candidates {
+                                                                ui.selectable_value(&mut boolean_back_idx, Some(*i), label);
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Операция:");
+                                                        egui::ComboBox::from_id_source("boolean_op").selected_text(boolean_op_label(boolean_op_kind)).show_ui(ui, |ui| {
+                                                            for op in [
+                                                                pony_core::BooleanOp::Union,
+                                                                pony_core::BooleanOp::Difference,
+                                                                pony_core::BooleanOp::Intersection,
+                                                                pony_core::BooleanOp::Xor,
+                                                                pony_core::BooleanOp::Divide,
+                                                            ] {
+                                                                ui.selectable_value(&mut boolean_op_kind, op, boolean_op_label(op));
+                                                            }
+                                                        });
+                                                    });
+                                                    ui.small(match boolean_op_kind {
+                                                        pony_core::BooleanOp::Union => "Объединить обе фигуры в одну (или несколько, если не пересекаются).",
+                                                        pony_core::BooleanOp::Difference => "Вычесть нижнюю фигуру из верхней.",
+                                                        pony_core::BooleanOp::Intersection => "Оставить только область пересечения.",
+                                                        pony_core::BooleanOp::Xor => "Оставить только непересекающиеся части — каждая сохраняет цвет своей исходной фигуры.",
+                                                        pony_core::BooleanOp::Divide => "Разрезать обе фигуры на все непересекающиеся куски (включая перекрытие) — как Illustrator/Animate Divide.",
+                                                    });
+
+                                                    let same_shape = boolean_front_idx.is_some() && boolean_front_idx == boolean_back_idx;
+                                                    if same_shape {
+                                                        ui.colored_label(egui::Color32::from_rgb(230, 150, 90), "Верхняя и нижняя фигура не могут совпадать.");
+                                                    }
+                                                    let can_run = boolean_front_idx.is_some() && boolean_back_idx.is_some() && !same_shape;
+                                                    if ui.add_enabled(can_run, egui::Button::new("Выполнить")).clicked() {
+                                                        if let (Some(fi), Some(bi)) = (boolean_front_idx, boolean_back_idx) {
+                                                            if let (Some(front), Some(back)) = (vector_doc.shapes.get(fi).cloned(), vector_doc.shapes.get(bi).cloned()) {
+                                                                if let Some(result) = pony_core::boolean_op(&front, &back, boolean_op_kind) {
+                                                                    // Удаляем исходные фигуры по убыванию индекса,
+                                                                    // чтобы удаление одной не сдвинуло индекс другой
+                                                                    // (тот же приём, что и везде при батч-удалении
+                                                                    // из Vec по нескольким индексам).
+                                                                    let mut to_remove = [fi, bi];
+                                                                    to_remove.sort_unstable();
+                                                                    vector_doc.shapes.remove(to_remove[1]);
+                                                                    vector_doc.shapes.remove(to_remove[0]);
+                                                                    let piece_count = result.pieces.len();
+                                                                    for piece in &result.pieces {
+                                                                        vector_doc.shapes.push(pony_core::piece_to_shape(piece));
+                                                                    }
+                                                                    boolean_front_idx = None;
+                                                                    boolean_back_idx = None;
+                                                                    selected_shape_index = None;
+                                                                    status_message = if result.dropped_holes > 0 {
+                                                                        format!("Boolean-операция: получено {piece_count} кусков(а), но {} внутренних контуров (дырок) отброшено — VectorShape::Polygon не хранит дырки", result.dropped_holes)
+                                                                    } else if piece_count == 0 {
+                                                                        "Boolean-операция: результат пуст (фигуры не пересекаются либо взаимно уничтожились)".to_string()
+                                                                    } else {
+                                                                        format!("Boolean-операция выполнена: получено {piece_count} куска(ов)")
+                                                                    };
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2674,6 +3547,7 @@ fn main() {
                                                     fill: color32_to_rgba(fill_color),
                                                     stroke: color32_to_rgba(stroke_color),
                                                     stroke_width: 1.5,
+                                                    fill_gradient: None,
                                                 });
                                                 status_message = "Путь Pen замкнут в многоугольник".into();
                                             } else {
@@ -2864,6 +3738,7 @@ fn main() {
                                                         fill,
                                                         stroke,
                                                         stroke_width: 1.5,
+                                                        fill_gradient: None,
                                                     }),
                                                     Tool::Oval => {
                                                         let rx = (end_world.x - start_world.x).abs() / 2.0;
@@ -2876,6 +3751,7 @@ fn main() {
                                                             fill,
                                                             stroke,
                                                             stroke_width: 1.5,
+                                                            fill_gradient: None,
                                                         })
                                                     }
                                                     Tool::Line => Some(pony_core::VectorShape::Line {
@@ -2899,7 +3775,7 @@ fn main() {
                                                                 (wx, -wy)
                                                             })
                                                             .collect();
-                                                        Some(pony_core::VectorShape::Polygon { points, fill, stroke, stroke_width: 1.5 })
+                                                        Some(pony_core::VectorShape::Polygon { points, fill, stroke, stroke_width: 1.5, fill_gradient: None })
                                                     }
                                                     _ => None,
                                                 };
@@ -2940,9 +3816,22 @@ fn main() {
                                         response.dragged() && matches!(active_tool, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Pencil | Tool::Brush);
 
                                     // Уже нарисованные фигуры — поверх сцены, в тех же экранных
-                                    // координатах, что и всё остальное на Stage.
+                                    // координатах, что и всё остальное на Stage. Symbol Instance
+                                    // (раздел 28 ТЗ) не рисуется напрямую — резолвится в
+                                    // конкретные фигуры символа (с уже применённым transform и
+                                    // fill_override этого инстанса, см. `resolve_symbol_instance`)
+                                    // и рисуется ТОЙ ЖЕ функцией превью, что и обычные фигуры —
+                                    // инстанс на Stage должен выглядеть неотличимо от инлайновой
+                                    // копии той же геометрии.
                                     for shape in &vector_doc.shapes {
-                                        draw_vector_shape_preview(painter, shape, &world_to_screen);
+                                        match shape {
+                                            pony_core::VectorShape::Instance { symbol, transform, fill_override } => {
+                                                for resolved in pony_core::resolve_symbol_instance(&vector_doc, symbol, *transform, *fill_override, 8) {
+                                                    draw_vector_shape_preview(painter, &resolved, &vector_doc, &world_to_screen);
+                                                }
+                                            }
+                                            other => draw_vector_shape_preview(painter, other, &vector_doc, &world_to_screen),
+                                        }
                                     }
 
                                     // Визуализация скелета — без неё костями просто нечем было бы

@@ -8,3 +8,20 @@ serde.workspace = true
 ron.workspace = true
 glam.workspace = true
 thiserror.workspace = true
+# Настоящий XML-парсер для VectorDoc::from_svg_str (раздел 16 ТЗ) —
+# заменяет прежний построчный разбор, который не мог открыть реальные
+# художественные SVG (группы, многострочные теги, CSS style=). roxmltree
+# уже транзитивно тянется в workspace через usvg (pony-render) — эта
+# зависимость не увеличивает граф, только даёт pony-core прямой доступ
+# к уже используемой библиотеке. Только чтение (read-only DOM), без
+# записи — сериализация (`to_svg_string`) остаётся ручной генерацией
+# текста, как и раньше.
+roxmltree.workspace = true
+# Boolean-геометрия (раздел 44 ТЗ, "Modify -> Combine Paths": Union/
+# Difference/Intersection/XOR/Divide) — настоящий проверенный
+# сканлайн-движок полигонального оверлея (в духе Vatti/Martinez-Rueda),
+# не собственная наивная реализация. Чистый Rust, без транзитивных
+# зависимостей вне workspace (i_shape/i_tree/i_key_sort/i_float/libm),
+# совместим с текущим потолком rustc/edition этого workspace (см.
+# комментарий у usvg в pony-render/Cargo.toml).
+i_overlay = "8.0"
