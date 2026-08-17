@@ -1097,3 +1097,13 @@ mod mask_gpu_tests {
         assert!(center[3] > 200 && center != bg, "битая ссылка clip_by не должна скрывать часть, got {center:?}");
     }
 }
+
+
+
+fn corners(p: &egui::Painter, r: egui::Rect, c: f32, s: egui::Stroke) {
+    let (l, t, r2, b) = (r.left(), r.top(), r.right(), r.bottom());
+    [(l,t),(r2,t),(l,b),(r2,b)].iter().for_each(|&(x,y)| {
+        p.line_segment([(x, if y == t { y + c } else { y - c }).into(), (x, y).into()], s);
+        p.line_segment([(x, y).into(), (if x == l { x + c } else { x - c }, y).into()], s);
+    });
+}

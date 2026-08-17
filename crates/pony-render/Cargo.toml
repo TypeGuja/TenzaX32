@@ -25,3 +25,4 @@ psd = "0.3"
 # 0.6.6 без лишних фич (только deflate) собирается чисто; более новые
 # минорные версии (проверено) тянут `time`-зависимость, требующую edition2024.
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+egui = "0.36.1"

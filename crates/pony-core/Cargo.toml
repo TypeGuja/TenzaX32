@@ -25,3 +25,4 @@ roxmltree.workspace = true
 # совместим с текущим потолком rustc/edition этого workspace (см.
 # комментарий у usvg в pony-render/Cargo.toml).
 i_overlay = "8.0"
+rand = "0.10.2"
