@@ -1,0 +1,400 @@
+(
+    name: "GuiPony",
+    version: "0.1.0",
+    parts: {
+        "mouth": (
+            id: "mouth",
+            kind: Mouth,
+            source: Vector(
+                path: "assets/pony_svg/mouth.svg",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 2,
+            bone: Some("Head"),
+        ),
+        "body": (
+            id: "body",
+            kind: Body,
+            source: Png(
+                path: "assets/pony/body.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 0,
+            bone: Some("Body"),
+        ),
+        "tail": (
+            id: "tail",
+            kind: Tail,
+            source: Vector(
+                path: "assets/pony_svg/tail.svg",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 0,
+            bone: Some("Body"),
+        ),
+        "wing_l": (
+            id: "wing_l",
+            kind: Wing,
+            source: Vector(
+                path: "assets/pony_svg/wing.svg",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 0,
+            bone: Some("Body"),
+        ),
+        "ear_l": (
+            id: "ear_l",
+            kind: Ear,
+            source: Png(
+                path: "assets/pony/ear.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 2,
+            bone: Some("EarL"),
+        ),
+        "head": (
+            id: "head",
+            kind: Head,
+            source: Png(
+                path: "assets/pony/head.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 1,
+            bone: Some("Head"),
+        ),
+        "ear_r": (
+            id: "ear_r",
+            kind: Ear,
+            source: Png(
+                path: "assets/pony/ear.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 2,
+            bone: Some("EarR"),
+        ),
+        "eye_l": (
+            id: "eye_l",
+            kind: Eyes,
+            source: Png(
+                path: "assets/pony/eye.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 2,
+            bone: Some("Head"),
+        ),
+        "horn": (
+            id: "horn",
+            kind: Horn,
+            source: Png(
+                path: "assets/pony/horn.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 2,
+            bone: Some("Horn"),
+        ),
+        "leg_fl": (
+            id: "leg_fl",
+            kind: LegFL,
+            source: Png(
+                path: "assets/pony/leg.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 0,
+            bone: Some("LowerLegFL"),
+        ),
+        "leg_fr": (
+            id: "leg_fr",
+            kind: LegFR,
+            source: Png(
+                path: "assets/pony/leg.png",
+            ),
+            pivot: (0.0, 0.0),
+            layer: 0,
+            bone: Some("LowerLegFR"),
+        ),
+    },
+    skeleton: (
+        bones: [
+            (
+                id: "Root",
+                parent: None,
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 0.0,
+            ),
+            (
+                id: "Body",
+                parent: Some("Root"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 40.0,
+            ),
+            (
+                id: "Neck",
+                parent: Some("Body"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 10.0,
+            ),
+            (
+                id: "Head",
+                parent: Some("Neck"),
+                local_transform: (
+                    position: (0.0, -0.6888938),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 15.0,
+            ),
+            (
+                id: "Horn",
+                parent: Some("Head"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 5.0,
+            ),
+            (
+                id: "EarL",
+                parent: Some("Head"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 4.0,
+            ),
+            (
+                id: "EarR",
+                parent: Some("Head"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 4.0,
+            ),
+            (
+                id: "ShoulderFL",
+                parent: Some("Body"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 5.0,
+            ),
+            (
+                id: "UpperLegFL",
+                parent: Some("ShoulderFL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "LowerLegFL",
+                parent: Some("UpperLegFL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "HoofFL",
+                parent: Some("LowerLegFL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 3.0,
+            ),
+            (
+                id: "ShoulderFR",
+                parent: Some("Body"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 5.0,
+            ),
+            (
+                id: "UpperLegFR",
+                parent: Some("ShoulderFR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "LowerLegFR",
+                parent: Some("UpperLegFR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "HoofFR",
+                parent: Some("LowerLegFR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 3.0,
+            ),
+            (
+                id: "ShoulderBL",
+                parent: Some("Body"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 5.0,
+            ),
+            (
+                id: "UpperLegBL",
+                parent: Some("ShoulderBL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "LowerLegBL",
+                parent: Some("UpperLegBL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "HoofBL",
+                parent: Some("LowerLegBL"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 3.0,
+            ),
+            (
+                id: "ShoulderBR",
+                parent: Some("Body"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 5.0,
+            ),
+            (
+                id: "UpperLegBR",
+                parent: Some("ShoulderBR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "LowerLegBR",
+                parent: Some("UpperLegBR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 12.0,
+            ),
+            (
+                id: "HoofBR",
+                parent: Some("LowerLegBR"),
+                local_transform: (
+                    position: (0.0, 0.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                length: 3.0,
+            ),
+        ],
+    ),
+    default_morph: (
+        weights: {},
+        eyes: (
+            radius: 1.0,
+            height: 1.0,
+            pupil: 1.0,
+            rotation: 0.0,
+        ),
+    ),
+    animations: {
+        "Walk": (
+            name: "Walk",
+            duration: 0.8,
+            tracks: [
+                (
+                    target: Bone(
+                        id: "Head",
+                        channel: PositionY,
+                    ),
+                    keyframes: [
+                        (
+                            time: 0.0,
+                            value: Float(0.0),
+                            interpolation: Linear,
+                        ),
+                        (
+                            time: 0.4,
+                            value: Float(-6.0),
+                            interpolation: Linear,
+                        ),
+                        (
+                            time: 0.8,
+                            value: Float(0.0),
+                            interpolation: Linear,
+                        ),
+                    ],
+                ),
+            ],
+            looping: true,
+        ),
+    },
+    physics: (
+        soft_bones: {},
+    ),
+    metadata: (
+        author: None,
+        description: None,
+        tags: [],
+    ),
+    facing_yaw: 0.0,
+)
