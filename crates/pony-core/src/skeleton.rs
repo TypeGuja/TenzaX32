@@ -74,11 +74,21 @@ impl Skeleton {
     /// часть кода (рендер частей, hit-тесты, редактор скелета) не должна
     /// каждый раз платить за прогон IK-солвера, когда констрейнтов нет.
     pub fn world_transform(&self, id: &str) -> Option<Transform2D> {
+        self.world_transform_depth(id, 0)
+    }
+
+    /// Обход вверх с ограничением глубины: в битом/поправленном руками
+    /// `.asset` может оказаться цикл родителей (A -> B -> A) — без
+    /// ограничения это переполнение стека и падение всего редактора.
+    fn world_transform_depth(&self, id: &str, depth: usize) -> Option<Transform2D> {
+        if depth > self.bones.len() {
+            return None;
+        }
         let bone = self.find(id)?;
         match &bone.parent {
             None => Some(bone.local_transform),
             Some(parent_id) => {
-                let parent_world = self.world_transform(parent_id)?;
+                let parent_world = self.world_transform_depth(parent_id, depth + 1)?;
                 Some(compose(parent_world, bone.local_transform))
             }
         }
@@ -135,6 +145,12 @@ impl Skeleton {
             // синтетической тестовой цепочке).
             let len_root = (mid_world.position - root_world.position).length();
             let len_mid = (tip_world.position - mid_world.position).length();
+            // Совпадающие кости (root == mid, кость в той же точке) дают
+            // нулевую длину звена — решатель делит на неё, NaN уходит в
+            // поворот, и всё, что висит на цепочке, пропадает с экрана.
+            if len_root < 1e-4 || len_mid < 1e-4 {
+                continue;
+            }
 
             // `solve_two_bone_ik` считает угол 0 как направление вдоль +X —
             // но кости в этом скелете обычно направлены как угодно (в
@@ -263,6 +279,15 @@ impl Skeleton {
                 b.parent = Some(new_id.to_string());
             }
         }
+        // IK ссылается на кости по имени — без этого переименование
+        // молча отключало констрейнт (кость "не найдена").
+        for c in &mut self.ik_constraints {
+            for bone in [&mut c.root, &mut c.mid, &mut c.tip] {
+                if bone == old_id {
+                    *bone = new_id.to_string();
+                }
+            }
+        }
         true
     }
 }
@@ -283,13 +308,16 @@ fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
 }
 
 fn compose(parent: Transform2D, local: Transform2D) -> Transform2D {
+    // Сначала масштаб родителя, потом его поворот — так же, как части
+    // (`part_world_position`) и рендер (`from_scale_rotation_translation`).
+    // Раньше было наоборот: у повёрнутой кости с неравномерным масштабом
+    // (например, после "Отразить по горизонтали", scale.x = -1) дочерние
+    // кости уезжали не туда, куда её части.
     let (sin, cos) = parent.rotation.sin_cos();
-    let rotated = Vec2::new(
-        local.position.x * cos - local.position.y * sin,
-        local.position.x * sin + local.position.y * cos,
-    );
+    let scaled = local.position * parent.scale;
+    let rotated = Vec2::new(scaled.x * cos - scaled.y * sin, scaled.x * sin + scaled.y * cos);
     Transform2D {
-        position: parent.position + rotated * parent.scale,
+        position: parent.position + rotated,
         rotation: parent.rotation + local.rotation,
         scale: parent.scale * local.scale,
     }
@@ -377,6 +405,45 @@ pub fn default_pony_skeleton() -> Skeleton {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn child_of_rotated_mirrored_bone_matches_part_placement() {
+        // Кость повёрнута на 90° и отражена по X. Дочерняя кость со
+        // смещением (10, 0) должна оказаться там же, где оказалась бы часть
+        // с таким же pivot: сначала масштаб (-10, 0), потом поворот -> (0, -10).
+        let mut sk = Skeleton::new();
+        sk.add_bone(Bone { id: "P".into(), parent: None, local_transform: Transform2D { position: Vec2::ZERO, rotation: std::f32::consts::FRAC_PI_2, scale: Vec2::new(-1.0, 1.0) }, length: 0.0 });
+        sk.add_bone(Bone { id: "C".into(), parent: Some("P".into()), local_transform: Transform2D { position: Vec2::new(10.0, 0.0), ..Default::default() }, length: 0.0 });
+        let c = sk.world_transform("C").unwrap().position;
+        assert!((c - Vec2::new(0.0, -10.0)).length() < 1e-4, "got {c:?}");
+    }
+
+    #[test]
+    fn rename_bone_updates_ik_constraints() {
+        let mut sk = default_pony_skeleton();
+        sk.add_ik_constraint(IkConstraint::new("leg", "UpperLegFL", "LowerLegFL", "HoofFL"));
+        assert!(sk.rename_bone("LowerLegFL", "Knee"));
+        assert_eq!(sk.ik_constraints[0].mid, "Knee");
+    }
+
+    #[test]
+    fn ik_with_zero_length_link_does_not_produce_nan() {
+        let mut sk = default_pony_skeleton();
+        // root == mid: длина первого звена 0
+        let mut c = IkConstraint::new("bad", "Head", "Head", "Horn");
+        c.target = Vec2::new(50.0, 50.0);
+        sk.add_ik_constraint(c);
+        let w = sk.world_transform_with_ik("Horn").unwrap();
+        assert!(w.position.is_finite() && w.rotation.is_finite(), "{w:?}");
+    }
+
+    #[test]
+    fn parent_cycle_does_not_overflow_the_stack() {
+        let mut sk = Skeleton::new();
+        sk.add_bone(Bone { id: "A".into(), parent: Some("B".into()), local_transform: Transform2D::default(), length: 0.0 });
+        sk.add_bone(Bone { id: "B".into(), parent: Some("A".into()), local_transform: Transform2D::default(), length: 0.0 });
+        assert!(sk.world_transform("A").is_none());
+    }
+
     use super::*;
 
     /// Регрессия на реальную находку: раньше у ВСЕХ костей скелета было

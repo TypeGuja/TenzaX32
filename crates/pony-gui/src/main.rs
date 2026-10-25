@@ -888,7 +888,7 @@ fn part_at(character: &Character, hidden: &HashSet<String>, locked: &HashSet<Str
 /// Центр и половины габарита части в мировых координатах — как её видно
 /// на Stage (с 2.5D-поворотом персонажа).
 fn part_screen_box(character: &Character, part: &Part) -> Option<(glam::Vec2, glam::Vec2)> {
-    let world = character.skeleton.world_transform(part.bone.as_ref()?)?;
+    let world = character.skeleton.world_transform_with_ik(part.bone.as_ref()?)?;
     let part_pos = pony_render::part_world_position(part, &world);
     let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
     let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
@@ -926,6 +926,18 @@ struct RenderKey {
     camera: pony_core::Camera,
     lighting: pony_core::Lighting,
     size: (u32, u32),
+}
+
+/// Первое свободное имя вида `base`, `base_2`, `base_3`... Счётчики вида
+/// "drawn_{N}" начинались с 1 при каждом запуске, и после открытия
+/// сохранённого персонажа новая фигура получала id уже существующей части
+/// (та молча заменялась, а её .svg перезаписывался), второй "Duplicate
+/// layer" затирал первую копию, новая кость получала id существующей.
+fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base}_{n}")).find(|c| !taken(c)).expect("бесконечный ряд кандидатов")
 }
 
 fn selected_bone_id(character: &pony_core::Character, selected: &Option<String>) -> Option<String> {
@@ -1613,7 +1625,10 @@ fn main() {
     // Windows это роняло приложение при старте с STATUS_ACCESS_VIOLATION
     // (0xC0000005). Бюджет считается только из доступной памяти, GPU для
     // него не нужны — см. WorkloadPolicy::from_profile.
-    let texture_budget = pony_system::WorkloadPolicy::from_profile(&pony_system::SystemProfile::detect_without_gpus()).memory_budget_bytes;
+    // Бюджет считается от ОПЕРАТИВНОЙ памяти, а текстуры живут в видеопамяти:
+    // 75% от 32 ГБ ОЗУ при 4 ГБ на видеокарте — кэш никогда бы не вытеснялся.
+    // Потолок 1 ГиБ — с запасом для десятков импортированных паппетов.
+    let texture_budget = pony_system::WorkloadPolicy::from_profile(&pony_system::SystemProfile::detect_without_gpus()).memory_budget_bytes.min(1 << 30);
     let mut pony_renderer = Renderer::new_with_budget(&gpu_ctx, texture_budget);
 
     let egui_ctx = egui::Context::default();
@@ -2090,7 +2105,7 @@ fn main() {
                                                             status_message = format!("Файл не найден: {import_path}");
                                                         } else {
                                                             import_count += 1;
-                                                            let part_id = format!("imported_{import_count}");
+                                                            let part_id = unique_name(&format!("imported_{import_count}"), |c| character.parts.contains_key(c));
                                                             character.add_part(
                                                                 pony_core::part::Part::new(&part_id, pony_core::part::PartKind::Custom, source)
                                                                     .with_bone("Body")
@@ -2142,7 +2157,7 @@ fn main() {
                                             if ui.add_enabled(has_sel, egui::Button::new("Duplicate layer")).clicked() {
                                                 if let Some(id) = selected_layer.clone() {
                                                     if let Some(src) = character.parts.get(&id).cloned() {
-                                                        let new_id = format!("{id}_copy");
+                                                        let new_id = unique_name(&format!("{id}_copy"), |c| character.parts.contains_key(c));
                                                         let mut copy = src.clone();
                                                         copy.id = new_id.clone();
                                                         copy.layer = src.layer + 1;
@@ -2241,7 +2256,7 @@ fn main() {
                                             ui.separator();
                                             if ui.button("Пустой слой (заглушка-цвет)").clicked() {
                                                 blank_layer_count += 1;
-                                                let id = format!("layer_{blank_layer_count}");
+                                                let id = unique_name(&format!("layer_{blank_layer_count}"), |c| character.parts.contains_key(c));
                                                 let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
                                                 character.add_part(
                                                     pony_core::part::Part::new(
@@ -2584,7 +2599,7 @@ fn main() {
                                                             Ok(()) => {
                                                                 pony_renderer.invalidate_texture(path);
                                                                 force_render = true;
-                                                                let bone_world = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)).unwrap_or_default();
+                                                                let bone_world = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)).unwrap_or_default();
                                                                 let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
                                                                 if let Some(p) = character.parts.get_mut(&edit_id) {
                                                                     p.pivot = pivot;
@@ -2607,10 +2622,14 @@ fn main() {
                                                 }
                                             } else {
                                                 svg_save_count += 1;
-                                                let path = format!("drawn_{svg_save_count}.svg");
+                                                // Не занятый ни частью, ни файлом на диске (иначе
+                                                // перезаписали бы .svg уже существующей части).
+                                                let part_id = unique_name(&format!("drawn_{svg_save_count}"), |c| {
+                                                    character.parts.contains_key(c) || std::path::Path::new(&format!("{c}.svg")).exists()
+                                                });
+                                                let path = format!("{part_id}.svg");
                                                 match std::fs::write(&path, vector_doc.to_svg_string()) {
                                                     Ok(()) => {
-                                                        let part_id = format!("drawn_{svg_save_count}");
 
                                                         // Часть должна встать ТУДА, где нарисована, и
                                                         // ТОГО размера, какого нарисована — иначе
@@ -2624,7 +2643,7 @@ fn main() {
                                                             .and_then(|id| character.parts.get(id))
                                                             .and_then(|p| p.bone.clone())
                                                             .unwrap_or_else(|| "Body".to_string());
-                                                        let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
+                                                        let bone_world = character.skeleton.world_transform_with_ik(&bone_id).unwrap_or_default();
                                                         let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
 
                                                         let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
@@ -2737,10 +2756,10 @@ fn main() {
                                                                 let old_world = part
                                                                     .bone
                                                                     .as_ref()
-                                                                    .and_then(|b| character.skeleton.world_transform(b))
+                                                                    .and_then(|b| character.skeleton.world_transform_with_ik(b))
                                                                     .unwrap_or_default();
                                                                 let keep_at = pony_render::part_world_position(&part, &old_world);
-                                                                let new_world = character.skeleton.world_transform(&target_bone).unwrap_or_default();
+                                                                let new_world = character.skeleton.world_transform_with_ik(&target_bone).unwrap_or_default();
                                                                 let new_pivot = pony_render::pivot_for_world_position(keep_at, &new_world);
                                                                 if let Some(p) = character.parts.get_mut(&id) {
                                                                     p.bone = Some(target_bone.clone());
@@ -2924,7 +2943,7 @@ fn main() {
                                                     ui.label(format!("Выбран слой: {id}"));
                                                     if let Some(part) = character.parts.get(id) {
                                                         if let Some(bone_id) = &part.bone {
-                                                            if let Some(world) = character.skeleton.world_transform(bone_id) {
+                                                            if let Some(world) = character.skeleton.world_transform_with_ik(bone_id) {
                                                                 ui.label(format!("Мировая позиция: {:.1}, {:.1}", world.position.x, world.position.y));
                                                             }
                                                         }
@@ -3038,17 +3057,26 @@ fn main() {
                                                             // Сохраняем мировые позиции частей, которые
                                                             // висели на удаляемых костях, ДО удаления —
                                                             // иначе их нечем будет пересчитать после.
+                                                            let doomed: Vec<String> = character.skeleton.bones.iter().filter(|b| character.skeleton.is_descendant_of(&b.id, &bid)).map(|b| b.id.clone()).collect();
+                                                            let keep_at: Vec<(String, glam::Vec2)> = character
+                                                                .parts
+                                                                .values()
+                                                                .filter(|p| p.bone.as_ref().is_some_and(|b| doomed.contains(b)))
+                                                                .filter_map(|p| {
+                                                                    let w = character.skeleton.world_transform_with_ik(p.bone.as_ref()?)?;
+                                                                    Some((p.id.clone(), pony_render::part_world_position(p, &w)))
+                                                                })
+                                                                .collect();
                                                             let removed = character.skeleton.remove_subtree(&bid);
                                                             if let Some(parent_id) = parent_id {
-                                                                for part in character.parts.values_mut() {
-                                                                    let Some(part_bone) = &part.bone else { continue };
-                                                                    if removed.contains(part_bone) {
-                                                                        // Кость уже удалена — её world_transform
-                                                                        // больше не посчитать, поэтому переносим
-                                                                        // часть на родителя с тем же смещением
-                                                                        // (примерно на месте, не идеально точно,
-                                                                        // но не телепортирует непредсказуемо).
+                                                                // Части удалённых костей переходят к родителю и
+                                                                // остаются там же на экране (раньше смещение
+                                                                // переносилось как есть, и часть прыгала).
+                                                                let parent_world = character.skeleton.world_transform_with_ik(&parent_id).unwrap_or_default();
+                                                                for (part_id, world_pos) in keep_at {
+                                                                    if let Some(part) = character.parts.get_mut(&part_id) {
                                                                         part.bone = Some(parent_id.clone());
+                                                                        part.pivot = pony_render::pivot_for_world_position(world_pos, &parent_world);
                                                                     }
                                                                 }
                                                             }
@@ -3107,7 +3135,17 @@ fn main() {
                                                             });
                                                         if let Some(np) = new_parent {
                                                             if Some(&np) != current_parent.as_ref() {
+                                                                let world_before = character.skeleton.world_transform(&bid);
                                                                 if character.skeleton.reparent(&bid, &np) {
+                                                                    // Кость остаётся на месте на экране: локальная поза
+                                                                    // пересчитывается под нового родителя (раньше
+                                                                    // старая локальная поза улетала вместе с ним).
+                                                                    if let (Some(before), Some(parent_world)) = (world_before, character.skeleton.world_transform(&np)) {
+                                                                        if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bid) {
+                                                                            bone.local_transform.position = pony_render::pivot_for_world_position(before.position, &parent_world);
+                                                                            bone.local_transform.rotation = before.rotation - parent_world.rotation;
+                                                                        }
+                                                                    }
                                                                     status_message = format!("'{bid}' теперь дочерняя для '{np}'");
                                                                 } else {
                                                                     status_message = "Нельзя: это создало бы цикл в иерархии".into();
@@ -3205,11 +3243,19 @@ fn main() {
                                                             }
                                                         });
                                                     });
-                                                    let can_create = ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some();
+                                                    // Root/Mid/Tip должны быть тремя разными костями: при
+                                                    // совпадении длина звена нулевая, и решатель IK
+                                                    // раньше превращал позу цепочки в NaN (части пропадали).
+                                                    let distinct = ik_new_root != ik_new_mid && ik_new_mid != ik_new_tip && ik_new_root != ik_new_tip;
+                                                    let can_create = ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some() && distinct;
+                                                    if ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some() && !distinct {
+                                                        ui.colored_label(egui::Color32::from_rgb(230, 150, 90), "Root, Mid и Tip должны быть разными костями");
+                                                    }
                                                     if ui.add_enabled(can_create, egui::Button::new("+ Создать IK-констрейнт")).clicked() {
                                                         let (root, mid, tip) = (ik_new_root.take().unwrap(), ik_new_mid.take().unwrap(), ik_new_tip.take().unwrap());
-                                                        let tip_world = character.skeleton.world_transform(&tip).unwrap_or_default();
-                                                        let mut constraint = pony_core::IkConstraint::new(format!("ik_{}", character.skeleton.ik_constraints.len() + 1), root, mid, tip);
+                                                        let tip_world = character.skeleton.world_transform_with_ik(&tip).unwrap_or_default();
+                                                        let ik_id = unique_name(&format!("ik_{}", character.skeleton.ik_constraints.len() + 1), |c| character.skeleton.ik_constraints.iter().any(|k| k.id == c));
+                                                        let mut constraint = pony_core::IkConstraint::new(ik_id, root, mid, tip);
                                                         // Target по умолчанию — текущая мировая позиция tip
                                                         // (нога не дёргается в момент создания констрейнта).
                                                         constraint.target = tip_world.position;
@@ -4102,7 +4148,7 @@ fn main() {
                                                     selected_layer = hit;
                                                 }
                                                 if let Some(part) = selected_layer.as_ref().filter(|id| !locked_layers.contains(*id)).and_then(|id| character.parts.get(id)) {
-                                                    if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)) {
+                                                    if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                         grab_offset = Some(pony_render::part_world_position(part, &world) - press_world);
                                                     }
                                                 }
@@ -4113,7 +4159,7 @@ fn main() {
                                                 let target = screen_to_world(pos) + offset;
                                                 let bone_id = character.parts.get(&id).and_then(|p| p.bone.clone());
                                                 if let Some(bone_id) = bone_id {
-                                                    let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
+                                                    let bone_world = character.skeleton.world_transform_with_ik(&bone_id).unwrap_or_default();
                                                     let new_pivot = pony_render::pivot_for_world_position(target, &bone_world);
                                                     if let Some(p) = character.parts.get_mut(&id) {
                                                         p.pivot = new_pivot;
@@ -4141,7 +4187,7 @@ fn main() {
                                                         .skeleton
                                                         .bones
                                                         .iter()
-                                                        .filter_map(|b| character.skeleton.world_transform(&b.id).map(|w| (b.id.clone(), world_to_screen(w.position).distance(origin))))
+                                                        .filter_map(|b| character.skeleton.world_transform_with_ik(&b.id).map(|w| (b.id.clone(), world_to_screen(w.position).distance(origin))))
                                                         .filter(|(_, d)| *d < 8.0)
                                                         .min_by(|a, b| a.1.total_cmp(&b.1))
                                                         .map(|(id, _)| id)
@@ -4193,7 +4239,7 @@ fn main() {
                                             // Free Transform). Угол между прошлой и текущей позицией
                                             // курсора относительно кости, в мировых координатах.
                                             if let (Some(bone_id), Some(pos)) = (selected_bone.clone(), response.interact_pointer_pos()) {
-                                                if let Some(center) = character.skeleton.world_transform(&bone_id).map(|w| w.position) {
+                                                if let Some(center) = character.skeleton.world_transform_with_ik(&bone_id).map(|w| w.position) {
                                                     let prev = screen_to_world(pos - response.drag_delta()) - center;
                                                     let cur = screen_to_world(pos) - center;
                                                     if prev.length() > 1e-3 && cur.length() > 1e-3 {
@@ -4223,8 +4269,8 @@ fn main() {
                                                 // родителя (раньше мировой сдвиг прибавлялся напрямую, и
                                                 // кость повёрнутого/отмасштабированного родителя уезжала
                                                 // не туда, куда тянули).
-                                                let parent_world = character.skeleton.find(&bone_id).and_then(|b| b.parent.clone()).and_then(|p| character.skeleton.world_transform(&p));
-                                                let bone_world = character.skeleton.world_transform(&bone_id);
+                                                let parent_world = character.skeleton.find(&bone_id).and_then(|b| b.parent.clone()).and_then(|p| character.skeleton.world_transform_with_ik(&p));
+                                                let bone_world = character.skeleton.world_transform_with_ik(&bone_id);
                                                 if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
                                                     match (parent_world, bone_world) {
                                                         (Some(parent_world), Some(bone_world)) => {
@@ -4256,9 +4302,9 @@ fn main() {
                                         if let Some(screen_pos) = response.interact_pointer_pos() {
                                             let target = screen_to_world(screen_pos);
                                             let parent_id = selected_bone.clone().unwrap_or_else(|| "Root".to_string());
-                                            if let Some(parent_world) = character.skeleton.world_transform(&parent_id) {
+                                            if let Some(parent_world) = character.skeleton.world_transform_with_ik(&parent_id) {
                                                 bone_count += 1;
-                                                let new_id = format!("Bone_{bone_count}");
+                                                let new_id = unique_name(&format!("Bone_{bone_count}"), |c| character.skeleton.find(c).is_some());
                                                 // Та же математика, что и у частей (compose() в Skeleton
                                                 // устроен идентично part_world_position) — клик даёт мировую
                                                 // точку, а хранить нужно смещение относительно родителя.
@@ -4415,7 +4461,7 @@ fn main() {
                                                 multi_selected.clear();
                                                 for (id, part) in &character.parts {
                                                     let Some(bone_id) = &part.bone else { continue };
-                                                    let Some(world) = character.skeleton.world_transform(bone_id) else { continue };
+                                                    let Some(world) = character.skeleton.world_transform_with_ik(bone_id) else { continue };
                                                     let pos = pony_render::part_world_position(part, &world);
                                                     if pos.x >= min_x && pos.x <= max_x && pos.y >= min_y && pos.y <= max_y {
                                                         multi_selected.insert(id.clone());
@@ -4429,7 +4475,7 @@ fn main() {
                                     // с обычным (синим) выделением одной части.
                                     for id in &multi_selected {
                                         if let Some(part) = character.parts.get(id) {
-                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)) {
+                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                 let pos = pony_render::part_world_position(part, &world);
                                                 let size = pony_render::part_render_size(part);
                                                 let half_w = size.x * world.scale.x.abs() / 2.0;
@@ -4616,12 +4662,12 @@ fn main() {
                                     // управлять: непонятно, где они, что чей родитель, что выбрано.
                                     if show_skeleton {
                                         for bone in &character.skeleton.bones {
-                                            let Some(world) = character.skeleton.world_transform(&bone.id) else { continue };
+                                            let Some(world) = character.skeleton.world_transform_with_ik(&bone.id) else { continue };
                                             let p = world_to_screen(glam::Vec2::new(world.position.x, world.position.y));
                                             let is_sel = selected_bone.as_deref() == Some(bone.id.as_str());
                                             let color = if is_sel { egui::Color32::from_rgb(255, 210, 60) } else { egui::Color32::from_rgb(120, 190, 255) };
                                             if let Some(parent_id) = &bone.parent {
-                                                if let Some(parent_world) = character.skeleton.world_transform(parent_id) {
+                                                if let Some(parent_world) = character.skeleton.world_transform_with_ik(parent_id) {
                                                     let pp = world_to_screen(glam::Vec2::new(parent_world.position.x, parent_world.position.y));
                                                     painter.line_segment([pp, p], egui::Stroke::new(1.5_f32, color.gamma_multiply(0.7)));
                                                 }
@@ -4642,7 +4688,7 @@ fn main() {
                                     // сейчас двигаешь и попал ли клик туда, куда целился.
                                     if let Some(sel_id) = &selected_layer {
                                         if let Some(part) = character.parts.get(sel_id) {
-                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)) {
+                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                 let part_pos = pony_render::part_world_position(part, &world);
                                                 let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
                                                 let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
@@ -4894,11 +4940,16 @@ fn main() {
                                             (None, _) => status_message = "Сначала выбери слой (на Stage или в Timeline)".into(),
                                         }
                                     }
-                                    Action::ExportGif => {
-                                        status_message = export_animation_gif(&mut pony_renderer, &gpu_ctx, &character, player.current_name(), &camera, &lighting);
-                                    }
-                                    Action::ExportSpritesheet => {
-                                        status_message = export_animation_spritesheet(&mut pony_renderer, &gpu_ctx, &character, player.current_name(), &camera, &lighting);
+                                    Action::ExportGif | Action::ExportSpritesheet => {
+                                        // Экспортируется то, что видно: скрытые в редакторе слои
+                                        // и группы раньше всё равно попадали в GIF/спрайт-лист.
+                                        let mut visible = character.clone();
+                                        visible.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
+                                        status_message = if action == Action::ExportGif {
+                                            export_animation_gif(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
+                                        } else {
+                                            export_animation_spritesheet(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
+                                        };
                                     }
                                 }
                                 needs_redraw = true;
@@ -5119,7 +5170,7 @@ mod timeline_tests {
     fn part_at_picks_topmost_visible_part() {
         let character = build_walking_pony();
         let none = HashSet::new();
-        let world = character.skeleton.world_transform("Head").unwrap();
+        let world = character.skeleton.world_transform_with_ik("Head").unwrap();
         let head_pos = pony_render::part_world_position(&character.parts["head"], &world);
         let hit = part_at(&character, &none, &none, head_pos).expect("в центре головы должна найтись часть");
         assert!(character.parts[&hit].layer >= character.parts["head"].layer);
@@ -5127,6 +5178,13 @@ mod timeline_tests {
         let mut hidden = HashSet::new();
         hidden.insert(hit.clone());
         assert_ne!(part_at(&character, &hidden, &none, head_pos).as_deref(), Some(hit.as_str()));
+    }
+
+    #[test]
+    fn unique_name_skips_taken_names() {
+        let taken = ["drawn_1", "drawn_1_2"];
+        assert_eq!(unique_name("drawn_1", |c| taken.contains(&c)), "drawn_1_3");
+        assert_eq!(unique_name("drawn_5", |c| taken.contains(&c)), "drawn_5");
     }
 
     #[test]

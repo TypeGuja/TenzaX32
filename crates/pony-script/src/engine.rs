@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rhai::{Engine, EvalAltResult, Scope};
+use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 
 use crate::commands::Command;
 
@@ -58,41 +58,67 @@ impl ScriptEngine {
     pub fn new() -> Self {
         let mut engine = Engine::new();
 
+        // Скрипт выполняется в потоке интерфейса: `loop {}` или очень
+        // длинный цикл вешал редактор насовсем. Предел операций превращает
+        // это в обычную ошибку скрипта.
+        engine.set_max_operations(5_000_000);
+
+        // Числа в rhai бывают целыми (`5`) и дробными (`5.0`), а функции
+        // регистрируются под точные типы: раньше `pony.Move(5, 0)` падал с
+        // "function not found" — работало только `pony.Move(5.0, 0.0)`.
+        // Поэтому аргументы принимаются как Dynamic и приводятся к числу.
+        type R = Result<(), Box<EvalAltResult>>;
+        fn num(v: &Dynamic) -> Result<f32, Box<EvalAltResult>> {
+            v.as_float()
+                .map(|f| f as f32)
+                .or_else(|_| v.as_int().map(|i| i as f32))
+                .map_err(|t| format!("ожидалось число, получено {t}").into())
+        }
+
         engine.register_type_with_name::<PonyProxy>("Pony");
-        engine.register_fn("Move", |p: &mut PonyProxy, dx: f64, dy: f64| {
-            p.push(Command::Move { dx: dx as f32, dy: dy as f32 });
+        engine.register_fn("Move", |p: &mut PonyProxy, dx: Dynamic, dy: Dynamic| -> R {
+            p.push(Command::Move { dx: num(&dx)?, dy: num(&dy)? });
+            Ok(())
         });
-        engine.register_fn("Look", |p: &mut PonyProxy, x: f64, y: f64| {
-            p.push(Command::Look { x: x as f32, y: y as f32 });
+        engine.register_fn("Look", |p: &mut PonyProxy, x: Dynamic, y: Dynamic| -> R {
+            p.push(Command::Look { x: num(&x)?, y: num(&y)? });
+            Ok(())
         });
         engine.register_fn("Blink", |p: &mut PonyProxy| {
             p.push(Command::Blink);
         });
-        engine.register_fn("Smile", |p: &mut PonyProxy, amount: f64| {
-            p.push(Command::Smile { amount: amount as f32 });
+        engine.register_fn("Smile", |p: &mut PonyProxy, amount: Dynamic| -> R {
+            p.push(Command::Smile { amount: num(&amount)? });
+            Ok(())
         });
         engine.register_fn("Walk", |p: &mut PonyProxy| {
             p.push(Command::Walk);
         });
 
         engine.register_type_with_name::<CameraProxy>("Camera");
-        engine.register_fn("Move", |c: &mut CameraProxy, dx: f64, dy: f64| {
-            c.push(Command::CameraMove { dx: dx as f32, dy: dy as f32 });
+        engine.register_fn("Move", |c: &mut CameraProxy, dx: Dynamic, dy: Dynamic| -> R {
+            c.push(Command::CameraMove { dx: num(&dx)?, dy: num(&dy)? });
+            Ok(())
         });
-        engine.register_fn("Rotate", |c: &mut CameraProxy, radians: f64| {
-            c.push(Command::CameraRotate { radians: radians as f32 });
+        engine.register_fn("Rotate", |c: &mut CameraProxy, radians: Dynamic| -> R {
+            c.push(Command::CameraRotate { radians: num(&radians)? });
+            Ok(())
         });
-        engine.register_fn("Zoom", |c: &mut CameraProxy, factor: f64| {
-            c.push(Command::CameraZoom { factor: factor as f32 });
+        engine.register_fn("Zoom", |c: &mut CameraProxy, factor: Dynamic| -> R {
+            c.push(Command::CameraZoom { factor: num(&factor)? });
+            Ok(())
         });
-        engine.register_fn("Shake", |c: &mut CameraProxy, intensity: f64| {
-            c.push(Command::CameraShake { intensity: intensity as f32 });
+        engine.register_fn("Shake", |c: &mut CameraProxy, intensity: Dynamic| -> R {
+            c.push(Command::CameraShake { intensity: num(&intensity)? });
+            Ok(())
         });
-        engine.register_fn("Depth", |c: &mut CameraProxy, value: f64| {
-            c.push(Command::CameraDepth { value: value as f32 });
+        engine.register_fn("Depth", |c: &mut CameraProxy, value: Dynamic| -> R {
+            c.push(Command::CameraDepth { value: num(&value)? });
+            Ok(())
         });
-        engine.register_fn("Blur", |c: &mut CameraProxy, value: f64| {
-            c.push(Command::CameraBlur { value: value as f32 });
+        engine.register_fn("Blur", |c: &mut CameraProxy, value: Dynamic| -> R {
+            c.push(Command::CameraBlur { value: num(&value)? });
+            Ok(())
         });
 
         Self { engine }
