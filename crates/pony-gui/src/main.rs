@@ -890,10 +890,11 @@ fn part_at(character: &Character, hidden: &HashSet<String>, locked: &HashSet<Str
 fn part_screen_box(character: &Character, part: &Part) -> Option<(glam::Vec2, glam::Vec2)> {
     let world = character.skeleton.world_transform_with_ik(part.bone.as_ref()?)?;
     let part_pos = pony_render::part_world_position(part, &world);
-    let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
+    let depth_z = pony_render::part_depth(character, part);
     let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
     let size = pony_render::part_render_size(part);
-    let half = glam::Vec2::new(size.x * world.scale.x.abs() * foreshorten / 2.0, size.y * world.scale.y.abs() / 2.0);
+    let morph = pony_render::part_morph_scale(character, part);
+    let half = glam::Vec2::new(size.x * world.scale.x.abs() * foreshorten * morph.x / 2.0, size.y * world.scale.y.abs() * morph.y / 2.0);
     Some((glam::Vec2::new(yawed_x, part_pos.y), half))
 }
 
@@ -938,6 +939,18 @@ fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
         return base.to_string();
     }
     (2..).map(|n| format!("{base}_{n}")).find(|c| !taken(c)).expect("бесконечный ряд кандидатов")
+}
+
+/// Длительность моргания от `pony.Blink()`.
+const BLINK_SECONDS: f32 = 0.25;
+
+/// Скрипт выставил морф Blink — превращаем его в короткое моргание (см.
+/// `blink_timer` в main), а не в навсегда закрытые глаза.
+fn take_blink(character: &mut Character, blink_timer: &mut f32) {
+    if character.default_morph.get("Blink") > 0.0 {
+        character.default_morph.set("Blink", 0.0);
+        *blink_timer = BLINK_SECONDS;
+    }
 }
 
 fn selected_bone_id(character: &pony_core::Character, selected: &Option<String>) -> Option<String> {
@@ -1279,7 +1292,7 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             }
             painter.add(egui::Shape::closed_line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
         }
-        VectorShape::Path { nodes, closed, fill, stroke, stroke_width, fill_gradient } => {
+        VectorShape::Path { nodes, closed, fill, stroke, stroke_width, fill_gradient, extra_contours } => {
             // Превью тесселирует каждый сегмент (прямой или кубическую
             // Безье) в ломаную из фиксированного числа отрезков — только
             // для оверлея на Stage. Сам сохранённый .svg хранит настоящие
@@ -1299,27 +1312,50 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             // вершина тесселяции несёт СВОЙ document-space цвет — и прямой,
             // и кривой сегмент дают достаточно плотную выборку вдоль
             // контура, чтобы градиент выглядел гладким, не гранёным.
+            //
+            // Дополнительные контуры (`extra_contours`, `M…Z M…Z` в одном
+            // `d`): отдельный кусок заливается, а дырка (контур внутри
+            // основного) в превью только обводится — egui-меш не умеет
+            // вычитать. В сохранённом .svg (resvg) дырка настоящая.
             const SEGMENTS: usize = 16;
-            let mut screen_pts: Vec<egui::Pos2> = Vec::new();
-            let mut doc_pts: Vec<(f32, f32)> = Vec::new();
-            if !nodes.is_empty() {
-                screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
-                doc_pts.push(nodes[0].position);
-                for i in 1..nodes.len() {
-                    tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+            let tessellate = |nodes: &[pony_core::PathNode], closed: bool| -> (Vec<egui::Pos2>, Vec<(f32, f32)>) {
+                let mut screen_pts: Vec<egui::Pos2> = Vec::new();
+                let mut doc_pts: Vec<(f32, f32)> = Vec::new();
+                if !nodes.is_empty() {
+                    screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
+                    doc_pts.push(nodes[0].position);
+                    for i in 1..nodes.len() {
+                        tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                    }
+                    if closed && nodes.len() > 1 {
+                        tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                    }
                 }
-                if *closed && nodes.len() > 1 {
-                    tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                (screen_pts, doc_pts)
+            };
+            let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
+            let fill_contour = |screen_pts: &[egui::Pos2], doc_pts: &[(f32, f32)]| {
+                if fill.a > 0 && screen_pts.len() >= 3 {
+                    let colors: Vec<egui::Color32> = doc_pts.iter().map(|(x, y)| color_at(*x, *y)).collect();
+                    if let Some(mesh) = triangulate_fill(screen_pts, &colors) {
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
                 }
+            };
+            let (main_screen, main_doc) = tessellate(nodes, *closed);
+            if *closed {
+                fill_contour(&main_screen, &main_doc);
             }
-            if *closed && fill.a > 0 && screen_pts.len() >= 3 {
-                let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
-                let colors: Vec<egui::Color32> = doc_pts.iter().map(|(x, y)| color_at(*x, *y)).collect();
-                if let Some(mesh) = triangulate_fill(&screen_pts, &colors) {
-                    painter.add(egui::Shape::mesh(mesh));
+            let stroke_style = egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke));
+            for contour in extra_contours {
+                let (screen_pts, doc_pts) = tessellate(&contour.nodes, contour.closed);
+                let is_hole = *closed && doc_pts.first().is_some_and(|p| point_in_polygon(*p, &main_doc));
+                if contour.closed && !is_hole {
+                    fill_contour(&screen_pts, &doc_pts);
                 }
+                painter.add(egui::Shape::line(screen_pts, stroke_style));
             }
-            painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+            painter.add(egui::Shape::line(main_screen, stroke_style));
         }
         VectorShape::Instance { .. } => {
             // Никогда не должен дойти сюда: вызывающая сторона (см. цикл
@@ -1330,6 +1366,18 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             debug_assert!(false, "draw_vector_shape_preview получил Instance напрямую — вызывающая сторона должна была резолвить его через resolve_symbol_instance");
         }
     }
+}
+
+/// Точка внутри многоугольника (чётность пересечений луча).
+fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < (b.0 - a.0) * (p.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// Разбить один сегмент path (`from` -> `to`, кривая если у концов есть
@@ -1844,6 +1892,11 @@ fn main() {
     // Предыдущий кадр: был ли повод перерисоваться ещё раз (анимация,
     // частицы, тряска, изменение документа) — иначе цикл спит (Wait).
     let mut needs_redraw = true;
+    // Моргание — короткое действие, а не состояние: `pony.Blink()` ставит
+    // таймер, глаз закрывается и открывается за BLINK_SECONDS. В самого
+    // персонажа это не пишется (иначе каждый кадр моргания был бы шагом
+    // Undo, а глаза после скрипта оставались закрытыми навсегда).
+    let mut blink_timer: f32 = 0.0;
     // Selection: смещение от точки захвата до центра части — чтобы часть
     // ехала за мышью с того места, за которое её взяли, а не прыгала центром.
     let mut grab_offset: Option<glam::Vec2> = None;
@@ -1902,6 +1955,15 @@ fn main() {
                             // часы и не решает это за нас (см. camera.rs), поэтому
                             // затухание — здесь, в игровом цикле GUI.
                             camera.shake_intensity = (camera.shake_intensity - dt * 0.6).max(0.0);
+                            if blink_timer > 0.0 {
+                                blink_timer = (blink_timer - dt).max(0.0);
+                                // Последний кадр моргания: персонаж не менялся, и без
+                                // принудительной перерисовки на экране оставался
+                                // полузакрытый глаз.
+                                if blink_timer == 0.0 {
+                                    force_render = true;
+                                }
+                            }
 
                             // Освещение реально пересчитывается из состояния UI-переключателей
                             // каждый кадр — не заглушка Lighting::default().
@@ -2335,6 +2397,7 @@ fn main() {
                                                     Ok(commands) => {
                                                         let n = commands.len();
                                                         pony_script::apply_commands(&mut character, &mut camera, &mut player, &commands);
+                                                        take_blink(&mut character, &mut blink_timer);
                                                         script_log = format!("OK: выполнено {n} команд(ы)");
                                                         status_message = script_log.clone();
                                                     }
@@ -2958,6 +3021,7 @@ fn main() {
                                                         Ok(commands) => {
                                                             let n = commands.len();
                                                             pony_script::apply_commands(&mut character, &mut camera, &mut player, &commands);
+                                                            take_blink(&mut character, &mut blink_timer);
                                                             script_log = format!("OK: выполнено {n} команд(ы)");
                                                         }
                                                         Err(err) => script_log = format!("Ошибка: {err}"),
@@ -4047,7 +4111,7 @@ fn main() {
                                     let up_to_date = last_render_key.as_ref().is_some_and(|k| {
                                         k.size == (render_w, render_h) && k.camera == view_camera && k.lighting == lighting && k.hidden == hidden_layers && k.character == character
                                     });
-                                    let animated_fx = particles_enabled || camera.shake_intensity > 0.0;
+                                    let animated_fx = particles_enabled || camera.shake_intensity > 0.0 || blink_timer > 0.0;
                                     if !up_to_date || animated_fx || force_render {
                                         force_render = false;
                                         let mut visible_character = character.clone();
@@ -4055,6 +4119,13 @@ fn main() {
                                         // которую она входит (по всей цепочке родителей, см.
                                         // `Character::is_part_hidden_by_group`).
                                         visible_character.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
+                                        if blink_timer > 0.0 {
+                                            // 0 -> 1 (закрыт) -> 0 за время моргания
+                                            let phase = 1.0 - blink_timer / BLINK_SECONDS;
+                                            let closed = (phase * std::f32::consts::PI).sin();
+                                            let current = visible_character.default_morph.get("Blink");
+                                            visible_character.default_morph.set("Blink", current.max(closed));
+                                        }
                                         let particles_arg = if particles_enabled { Some(&particle_emitter) } else { None };
                                         let rendered = pony_renderer.render_character(&gpu_ctx, &visible_character, render_w, render_h, &view_camera, elapsed_time, &lighting, particles_arg);
                                         let color_image = egui::ColorImage::from_rgba_unmultiplied([rendered.width as usize, rendered.height as usize], &rendered.rgba);
@@ -4690,7 +4761,7 @@ fn main() {
                                         if let Some(part) = character.parts.get(sel_id) {
                                             if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                 let part_pos = pony_render::part_world_position(part, &world);
-                                                let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
+                                                let depth_z = pony_render::part_depth(&character, part);
                                                 let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
                                                 let size = pony_render::part_render_size(part);
                                                 let half_w = size.x * world.scale.x.abs() * foreshorten / 2.0;
@@ -5021,7 +5092,7 @@ fn main() {
                             // события — раньше окно молотило CPU/GPU на 100% всегда.
                             let egui_repaint = full_output.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
                             let render_stale = !last_render_key.as_ref().is_some_and(|k| k.character == character && k.hidden == hidden_layers && k.lighting == lighting);
-                            let busy = playing || particles_enabled || camera.shake_intensity > 0.0 || render_stale || needs_redraw || autoexit_at.is_some();
+                            let busy = playing || particles_enabled || camera.shake_intensity > 0.0 || blink_timer > 0.0 || render_stale || needs_redraw || autoexit_at.is_some();
                             needs_redraw = false;
                             match egui_repaint {
                                 _ if busy => window.request_redraw(),

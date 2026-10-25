@@ -64,7 +64,44 @@ fn report_system_and_build_runtime() -> (SystemProfile, WorkloadPolicy, rayon::T
     (profile, policy, thread_pool, render_cluster)
 }
 
+/// Куда писать результаты (кадры .ppm, GIF, спрайт-лист, .asset): папка,
+/// из которой запустили программу, даже если для поиска ассетов пришлось
+/// перейти в корень репозитория (см. `enter_workspace_root`).
+static OUT_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn out(name: &str) -> String {
+    match OUT_DIR.get() {
+        Some(dir) => dir.join(name).to_string_lossy().into_owned(),
+        None => name.to_string(),
+    }
+}
+
+/// Ассеты подключены относительными путями (`assets/pony/...`). Запуск не
+/// из корня репозитория раньше давал только цветные заглушки вместо
+/// текстур. Ищем папку с `assets/` (корень workspace из времени сборки,
+/// предки exe, предки текущей папки) и переходим в неё, а результаты по-
+/// прежнему пишем туда, откуда запускали.
+fn enter_workspace_root() {
+    let has_assets = |dir: &std::path::Path| dir.join("assets").join("pony").is_dir();
+    let Ok(cwd) = std::env::current_dir() else { return };
+    if has_assets(&cwd) {
+        return;
+    }
+    let mut candidates = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")];
+    if let Ok(exe) = std::env::current_exe() {
+        candidates.extend(exe.ancestors().skip(1).map(|p| p.to_path_buf()));
+    }
+    candidates.extend(cwd.ancestors().skip(1).map(|p| p.to_path_buf()));
+    if let Some(root) = candidates.into_iter().find(|d| has_assets(d)) {
+        if std::env::set_current_dir(&root).is_ok() {
+            let _ = OUT_DIR.set(cwd.clone());
+            println!("Ассеты: {} · результаты пишутся в {}", root.display(), cwd.display());
+        }
+    }
+}
+
 fn main() {
+    enter_workspace_root();
     let (_profile, policy, thread_pool, render_cluster) = report_system_and_build_runtime();
 
     // Демонстрация того, зачем нужен пул: параллельно считаем мировые
@@ -249,7 +286,7 @@ fn render_scene_demo(render_cluster: &RenderCluster) {
 }
 
 fn save_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) {
-    let mut file = std::fs::File::create(path).expect("failed to create ppm file");
+    let mut file = std::fs::File::create(out(path)).expect("failed to create ppm file");
     write!(file, "P6\n{width} {height}\n255\n").unwrap();
     for px in rgba.chunks_exact(4) {
         file.write_all(&px[0..3]).unwrap(); // отбрасываем alpha, PPM его не поддерживает
@@ -391,7 +428,7 @@ fn gif_export_demo(render_cluster: &RenderCluster) {
         player.advance(&character, dt);
     }
 
-    let gif_path = "walk_cycle.gif";
+    let gif_path = &out("walk_cycle.gif");
     // 100/FPS сотых долей секунды на кадр — единица измерения самого GIF.
     let delay_cs = (100.0 / FPS).round() as u16;
     match export_gif(gif_path, &frames, delay_cs) {
@@ -402,7 +439,7 @@ fn gif_export_demo(render_cluster: &RenderCluster) {
         Err(err) => println!("Ошибка экспорта GIF: {err}"),
     }
 
-    let sheet_path = "walk_cycle_sheet.png";
+    let sheet_path = &out("walk_cycle_sheet.png");
     match export_spritesheet(sheet_path, &frames, 5) {
         Ok(layout) => {
             let size = std::fs::metadata(sheet_path).map(|m| m.len()).unwrap_or(0);
@@ -796,7 +833,7 @@ fn run_asset_demo() {
 
     character.add_animation(blink).add_animation(idle_head_bob);
 
-    let out_path = "sample_pony.asset";
+    let out_path = &out("sample_pony.asset");
     character.save_to_file(out_path).expect("failed to save asset");
     println!("Saved character to {out_path}");
 

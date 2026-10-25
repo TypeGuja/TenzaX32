@@ -1320,7 +1320,15 @@ pub fn import_to_character(
             length: 0.0,
         });
         let lower = p.id.to_lowercase();
-        let kind = if lower.contains("head") {
+        // Глаза и рот — первыми: у раскрытого контейнера головы их id
+        // "HEAD.EYE_mask", "HEAD.MOUTH", и они должны реагировать на
+        // выражения (Blink/Smile), а не считаться головой.
+        let leaf = lower.rsplit('.').next().unwrap_or(&lower);
+        let kind = if leaf.contains("eye") && !leaf.contains("brow") && !leaf.contains("lash") {
+            PartKind::Eyes
+        } else if leaf.contains("mouth") {
+            PartKind::Mouth
+        } else if lower.contains("head") {
             PartKind::Head
         } else if lower.contains("tail") {
             PartKind::Tail

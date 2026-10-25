@@ -411,6 +411,13 @@ pub enum VectorShape {
         stroke_width: f32,
         #[serde(default)]
         fill_gradient: Option<String>,
+        /// Дополнительные контуры того же пути — в SVG это `M…Z M…Z`
+        /// в одном `d`: дырки (бублик, блик в глазу) и отдельные куски.
+        /// Раньше все контуры склеивались в один, и форма ломалась. Пишутся
+        /// в тот же `d` после основного; заливка — по правилу SVG по
+        /// умолчанию (nonzero), дырки получаются за счёт обратного обхода.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_contours: Vec<Contour>,
     },
     /// Symbol Instance (раздел 28 ТЗ: "Symbol — reusable object" +
     /// раздел 95: "Symbol instance overrides"). Ссылается на переиспользуемое
@@ -438,6 +445,13 @@ pub enum VectorShape {
         /// использования, не создавая второе определение).
         fill_override: Option<RgbaColor>,
     },
+}
+
+/// Один дополнительный контур `VectorShape::Path` (см. `extra_contours`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Contour {
+    pub nodes: Vec<PathNode>,
+    pub closed: bool,
 }
 
 /// Переиспользуемое определение (раздел 28 ТЗ: "Symbol Definition") —
@@ -698,22 +712,29 @@ fn transform_shape(shape: &VectorShape, t: (f32, f32, f32, f32, f32, f32)) -> Ve
             stroke,
             stroke_width,
             fill_gradient: _,
-        } => VectorShape::Path {
-            nodes: nodes
-                .iter()
-                .map(|n| PathNode {
-                    position: symbol_instance_transform_apply(t, n.position),
-                    in_handle: n.in_handle.map(|h| symbol_instance_transform_apply(t, h)),
-                    out_handle: n.out_handle.map(|h| symbol_instance_transform_apply(t, h)),
-                    node_type: n.node_type,
-                })
-                .collect(),
-            closed: *closed,
-            fill: *fill,
-            stroke: *stroke,
-            stroke_width: stroke_width * scale,
-            fill_gradient: None,
-        },
+            extra_contours,
+        } => {
+            let tf = |nodes: &[PathNode]| -> Vec<PathNode> {
+                nodes
+                    .iter()
+                    .map(|n| PathNode {
+                        position: symbol_instance_transform_apply(t, n.position),
+                        in_handle: n.in_handle.map(|h| symbol_instance_transform_apply(t, h)),
+                        out_handle: n.out_handle.map(|h| symbol_instance_transform_apply(t, h)),
+                        node_type: n.node_type,
+                    })
+                    .collect()
+            };
+            VectorShape::Path {
+                nodes: tf(nodes),
+                closed: *closed,
+                fill: *fill,
+                stroke: *stroke,
+                stroke_width: stroke_width * scale,
+                fill_gradient: None,
+                extra_contours: extra_contours.iter().map(|c| Contour { nodes: tf(&c.nodes), closed: c.closed }).collect(),
+            }
+        }
         VectorShape::Instance { .. } => {
             debug_assert!(false, "transform_shape вызван на Instance — вызывающая сторона (resolve_symbol_instance) должна обрабатывать Instance отдельной веткой");
             shape.clone()
@@ -837,8 +858,13 @@ impl VectorShape {
                 stroke,
                 stroke_width,
                 fill_gradient,
+                extra_contours,
             } => {
-                let d = path_data_string(nodes, *closed);
+                let mut d = path_data_string(nodes, *closed);
+                for c in extra_contours {
+                    d.push(' ');
+                    d.push_str(&path_data_string(&c.nodes, c.closed));
+                }
                 let (fill_paint, fill_op) = if *closed {
                     resolved_fill_paint(*fill, fill_gradient, known_gradients)
                 } else {
@@ -907,7 +933,7 @@ impl VectorShape {
                 }
                 (min_x, min_y, max_x, max_y)
             }
-            VectorShape::Path { nodes, .. } => {
+            VectorShape::Path { nodes, extra_contours, .. } => {
                 let mut min_x = f32::MAX;
                 let mut min_y = f32::MAX;
                 let mut max_x = f32::MIN;
@@ -920,7 +946,7 @@ impl VectorShape {
                 // выпуклая оболочка узлов и их ручек её гарантированно
                 // содержит (свойство кривых Безье: кривая всегда лежит
                 // внутри выпуклой оболочки своих контрольных точек).
-                for node in nodes {
+                for node in nodes.iter().chain(extra_contours.iter().flat_map(|c| c.nodes.iter())) {
                     for pt in [Some(node.position), node.in_handle, node.out_handle]
                         .into_iter()
                         .flatten()
@@ -1148,9 +1174,11 @@ impl VectorShape {
             VectorShape::Polyline { points, .. } | VectorShape::Polygon { points, .. } => {
                 points.clone()
             }
-            VectorShape::Path { nodes, .. } => {
+            VectorShape::Path { nodes, extra_contours, .. } => {
+                // Узлы основного контура, затем дополнительных — тот же
+                // порядок обхода, что в `set_control_point`.
                 let mut pts = Vec::new();
-                for node in nodes {
+                for node in nodes.iter().chain(extra_contours.iter().flat_map(|c| c.nodes.iter())) {
                     pts.push(node.position);
                     if let Some(h) = node.in_handle {
                         pts.push(h);
@@ -1221,9 +1249,9 @@ impl VectorShape {
                     *p = pos;
                 }
             }
-            VectorShape::Path { nodes, .. } => {
+            VectorShape::Path { nodes, extra_contours, .. } => {
                 let mut i = 0;
-                for node in nodes.iter_mut() {
+                for node in nodes.iter_mut().chain(extra_contours.iter_mut().flat_map(|c| c.nodes.iter_mut())) {
                     if i == index {
                         // Перемещение самой позиции узла тащит обе ручки
                         // вместе с ней на ту же дельту — раздел 9
@@ -2143,6 +2171,7 @@ fn transformed_ellipse(cx: f32, cy: f32, rx: f32, ry: f32, t: Transform2x3, styl
         stroke: style.stroke,
         stroke_width: style.stroke_width * t.scale_factor(),
         fill_gradient: style.fill_gradient.clone(),
+        extra_contours: Vec::new(),
     }
 }
 
@@ -2333,22 +2362,22 @@ fn collect_shapes(
                     unsupported.push("path (без атрибута d)".to_string());
                     continue;
                 };
-                let Some((nodes, closed)) = parse_path_d(d) else {
+                let Some(mut contours) = parse_path_contours(d) else {
                     unsupported.push(format!(
                         "path (нераспознанная геометрия d=\"{}\")",
                         &d[..d.len().min(40)]
                     ));
                     continue;
                 };
-                let nodes: Vec<PathNode> = nodes
-                    .into_iter()
-                    .map(|n| PathNode {
-                        position: combined.apply(n.position),
-                        in_handle: n.in_handle.map(|h| combined.apply(h)),
-                        out_handle: n.out_handle.map(|h| combined.apply(h)),
-                        node_type: n.node_type,
-                    })
-                    .collect();
+                for c in &mut contours {
+                    for n in &mut c.nodes {
+                        n.position = combined.apply(n.position);
+                        n.in_handle = n.in_handle.map(|h| combined.apply(h));
+                        n.out_handle = n.out_handle.map(|h| combined.apply(h));
+                    }
+                }
+                let main = contours.remove(0);
+                let (nodes, closed) = (main.nodes, main.closed);
                 let style = resolve_style(child);
                 doc.add(VectorShape::Path {
                     nodes,
@@ -2357,6 +2386,7 @@ fn collect_shapes(
                     stroke: style.stroke,
                     stroke_width: style.stroke_width * combined.scale_factor(),
                     fill_gradient: style.fill_gradient.clone(),
+                    extra_contours: contours,
                 });
             }
             "defs" => {
@@ -2891,9 +2921,21 @@ fn arc_to_cubic_beziers(
 /// `path_data_string`, поэтому "нарисовали → сохранили → открыли снова"
 /// не теряет форму кривой, даже если сам путь изначально пришёл ИЗВНЕ
 /// (импортирован не из этого редактора) в сокращённой SVG-нотации.
+#[cfg(test)]
 fn parse_path_d(d: &str) -> Option<(Vec<PathNode>, bool)> {
+    parse_path_contours(d).map(|mut c| {
+        let first = c.remove(0);
+        (first.nodes, first.closed)
+    })
+}
+
+/// Все контуры `d` по отдельности: каждый `M` начинает новый, `Z`
+/// замыкает текущий. Первый — основной контур `VectorShape::Path`,
+/// остальные идут в `extra_contours`.
+fn parse_path_contours(d: &str) -> Option<Vec<Contour>> {
     let tokens = tokenize_path_d(d);
     let mut i = 0;
+    let mut contours: Vec<Contour> = Vec::new();
     let mut nodes: Vec<PathNode> = Vec::new();
     let mut closed = false;
     let mut cursor = (0.0f32, 0.0f32);
@@ -2920,6 +2962,16 @@ fn parse_path_d(d: &str) -> Option<(Vec<PathNode>, bool)> {
             },
         };
         last_cmd = Some(cmd);
+        // Новый контур: явный M, или рисующая команда сразу после Z (по
+        // SVG она начинается из начала только что замкнутого подпути).
+        let upper = cmd.to_ascii_uppercase();
+        if !nodes.is_empty() && (upper == 'M' || (closed && upper != 'Z')) {
+            contours.push(Contour { nodes: std::mem::take(&mut nodes), closed });
+            closed = false;
+            if upper != 'M' {
+                nodes.push(PathNode::corner(subpath_start));
+            }
+        }
         let relative = cmd.is_ascii_lowercase();
         let take_num = |i: &mut usize| -> Option<f32> {
             match tokens.get(*i) {
@@ -3131,10 +3183,14 @@ fn parse_path_d(d: &str) -> Option<(Vec<PathNode>, bool)> {
             _ => return None,
         }
     }
-    if nodes.is_empty() {
+    if !nodes.is_empty() {
+        contours.push(Contour { nodes, closed });
+    }
+    contours.retain(|c| !c.nodes.is_empty());
+    if contours.is_empty() {
         None
     } else {
-        Some((nodes, closed))
+        Some(contours)
     }
 }
 
@@ -3199,6 +3255,26 @@ fn tokenize_path_d(d: &str) -> Vec<PathToken> {
 mod tests {
 
     #[test]
+    fn multi_contour_path_keeps_every_contour_through_round_trip() {
+        // Квадрат с квадратной дыркой (обратный обход) — один <path>.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0 H10 V10 H0 Z M3 3 V7 H7 V3 Z" fill="red"/></svg>"#;
+        let doc = VectorDoc::from_svg_str(svg).unwrap();
+        let VectorShape::Path { nodes, extra_contours, closed, .. } = &doc.shapes[0] else { panic!() };
+        assert_eq!(nodes.len(), 4);
+        assert!(*closed);
+        assert_eq!(extra_contours.len(), 1, "дырка — отдельный контур, а не продолжение квадрата");
+        assert_eq!(extra_contours[0].nodes[0].position, (3.0, 3.0));
+        // сохранение -> чтение: оба контура на месте, по-прежнему одна фигура
+        let back = VectorDoc::from_svg_str(&doc.to_svg_string()).unwrap();
+        assert_eq!(back.shapes.len(), 1);
+        let VectorShape::Path { extra_contours, .. } = &back.shapes[0] else { panic!() };
+        assert_eq!(extra_contours.len(), 1);
+        // узлы дырки доступны для редактирования
+        assert_eq!(doc.shapes[0].control_points().len(), 8);
+    }
+
+
+    #[test]
     fn transform_list_applies_rightmost_function_first() {
         let doc = VectorDoc::from_svg_str(r#"<svg xmlns="http://www.w3.org/2000/svg"><rect transform="translate(10,0) scale(2)" x="1" y="0" width="1" height="1"/></svg>"#).unwrap();
         let VectorShape::Rect { x, w, .. } = doc.shapes[0] else { panic!() };
@@ -3237,8 +3313,9 @@ mod tests {
 
     #[test]
     fn relative_move_after_close_starts_from_subpath_start() {
-        let (nodes, _) = parse_path_d("M10 10 l5 0 l0 5 z m1 1 l1 0").unwrap();
-        assert!(nodes.iter().any(|n| n.position == (11.0, 11.0)), "{nodes:?}");
+        let contours = parse_path_contours("M10 10 l5 0 l0 5 z m1 1 l1 0").unwrap();
+        assert_eq!(contours.len(), 2);
+        assert_eq!(contours[1].nodes[0].position, (11.0, 11.0), "{contours:?}");
     }
 
     #[test]
@@ -4083,6 +4160,7 @@ mod tests {
             parse_path_d("M 0 10 A 10 10 0 0 1 10 0 L 10 -10").expect("должен разобраться");
         let mut doc = VectorDoc::new();
         doc.add(VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes,
             closed,
             fill: RgbaColor::new(0, 0, 0, 0),
@@ -4138,6 +4216,7 @@ mod tests {
         n1.in_handle = Some((20.0, -5.0));
         let n2 = PathNode::corner((50.0, 0.0)); // прямой сегмент от n1 к n2 — без ручек
         doc.add(VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes: vec![n0, n1, n2],
             closed: false,
             fill: RgbaColor::new(0, 0, 0, 0),
@@ -4189,6 +4268,7 @@ mod tests {
         node.in_handle = Some((5.0, 10.0));
         node.out_handle = Some((15.0, 10.0));
         let mut shape = VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes: vec![node],
             closed: false,
             fill: RED,
@@ -4214,6 +4294,7 @@ mod tests {
         let mut n1 = PathNode::corner((20.0, 0.0));
         n1.in_handle = Some((15.0, 0.0));
         let shape = VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes: vec![n0, n1],
             closed: false,
             fill: RED,
