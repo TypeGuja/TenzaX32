@@ -3814,6 +3814,7 @@ fn main() {
                                 // --- окно импорта Adobe Animate ---
                                 if xfl_window_open {
                                     let mut open = true;
+                                    let mut xfl_toggle_hidden: Option<bool> = None;
                                     egui::Window::new("Импорт Adobe Animate").open(&mut open).default_width(640.0).default_pos(egui::pos2(220.0, 70.0)).show(ctx, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("Файл .fla / .xfl / папка XFL:");
@@ -3908,6 +3909,16 @@ fn main() {
                                                 ui.horizontal(|ui| {
                                                     ui.label("Масштаб:");
                                                     ui.add(egui::DragValue::new(&mut xfl_opts.scale).speed(0.01).clamp_range(0.01..=10.0)).on_hover_text("Мировых единиц на пиксель Animate");
+                                                    {
+                                                        let mut v = doc.include_hidden_layers;
+                                                        if ui
+                                                            .checkbox(&mut v, "Скрытые слои")
+                                                            .on_hover_text("Слои, скрытые глазком в Animate. Animate по умолчанию публикует их (так выглядит готовый мультфильм) — у Луны там тёмно-синяя грива и звёзды.")
+                                                            .changed()
+                                                        {
+                                                            xfl_toggle_hidden = Some(v);
+                                                        }
+                                                    }
                                                     ui.checkbox(&mut xfl_opts.expand_containers, "Раскрыть «~»-контейнеры")
                                                         .on_hover_text("Вложенные символы с именем на «~» (например ~RD_Head) раскладываются на отдельные части: глаза, рот, брови…");
                                                 });
@@ -3918,6 +3929,10 @@ fn main() {
                                             });
                                         });
                                     });
+                                    if let (Some(v), Some(d)) = (xfl_toggle_hidden, xfl_doc.as_mut()) {
+                                        d.include_hidden_layers = v;
+                                        xfl_preview_key = None;
+                                    }
                                     xfl_window_open = open;
                                 }
 

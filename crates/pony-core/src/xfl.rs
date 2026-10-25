@@ -270,13 +270,19 @@ impl Timeline {
         (self.layers.get(p)?.kind == LayerKind::Mask).then_some(p)
     }
 
-    fn layer_hidden(&self, li: usize) -> bool {
-        // Слой скрыт, если скрыт он сам или любая папка над ним.
+    /// Не попадает в картинку: направляющий слой (или слой в папке-
+    /// направляющей) — всегда; слой, скрытый глазком (сам или его папка), —
+    /// только если `include_hidden == false`. Animate по умолчанию
+    /// ПУБЛИКУЕТ скрытые слои (Publish Settings → «Include hidden layers»,
+    /// `<InvisibleLayer>1`): художники прячут слои для удобства работы, а в
+    /// готовом мультфильме они видны. Раньше импорт их пропускал, и у Луны
+    /// пропадала тёмно-синяя заливка и звёзды гривы — оставался только контур.
+    fn layer_hidden(&self, li: usize, include_hidden: bool) -> bool {
         let mut cur = Some(li);
         let mut guard = 0;
         while let Some(i) = cur {
             let l = &self.layers[i];
-            if !l.visible || l.kind == LayerKind::Guide {
+            if l.kind == LayerKind::Guide || (!l.visible && !include_hidden) {
                 return true;
             }
             cur = l.parent;
@@ -307,6 +313,10 @@ pub struct XflDocument {
     /// Что не удалось разобрать (битые символы и т.п.) — честно сообщаем
     /// пользователю, а не молча теряем.
     pub warnings: Vec<String>,
+    /// Рисовать слои, скрытые глазком (см. `Timeline::layer_hidden`).
+    /// Берётся из Publish Settings документа (`<InvisibleLayer>`), по
+    /// умолчанию — да, как публикует Animate. Можно переключить в окне импорта.
+    pub include_hidden_layers: bool,
 }
 
 // ------------------------------------------------------------ контейнер
@@ -423,6 +433,10 @@ impl XflDocument {
             main: Timeline { name: "Scene 1".into(), layers: Vec::new() },
             symbols: HashMap::new(),
             warnings: Vec::new(),
+            include_hidden_layers: files
+                .get("PublishSettings.xml")
+                .map(|b| !decode_xml(b).contains("<InvisibleLayer>0</InvisibleLayer>"))
+                .unwrap_or(true),
         };
         if let Some(tl) = child(root, "timelines").and_then(|t| child(t, "DOMTimeline")) {
             doc.main = parse_timeline(tl);
@@ -1054,7 +1068,7 @@ impl XflDocument {
         let outer_bbox = out.bbox.take();
         // Слои снизу вверх (в XFL первый — верхний).
         for li in (0..tl.layers.len()).rev() {
-            if tl.layer_is_masked_by(li) == Some(mask) && !tl.layer_hidden(li) {
+            if tl.layer_is_masked_by(li) == Some(mask) && !tl.layer_hidden(li, self.include_hidden_layers) {
                 self.emit_layer(out, tl, li, frame, m, ct, depth);
             }
         }
@@ -1074,7 +1088,7 @@ impl XflDocument {
     }
 
     fn emit_timeline(&self, out: &mut SvgOut, tl: &Timeline, frame: usize, m: &Matrix, ct: &ColorTransform, depth: usize) {
-        for unit in render_units(tl) {
+        for unit in render_units(tl, self.include_hidden_layers) {
             self.emit_unit(out, tl, unit, frame, m, ct, depth);
         }
     }
@@ -1090,12 +1104,12 @@ impl XflDocument {
 
 /// Порядок отрисовки слоёв временной шкалы снизу вверх. Замаскированные
 /// слои в список не входят — их рисует слой-маска вместе с собой.
-fn render_units(tl: &Timeline) -> Vec<usize> {
+fn render_units(tl: &Timeline, include_hidden: bool) -> Vec<usize> {
     (0..tl.layers.len())
         .rev()
         .filter(|&li| {
             let l = &tl.layers[li];
-            l.kind != LayerKind::Folder && !tl.layer_hidden(li) && tl.layer_is_masked_by(li).is_none()
+            l.kind != LayerKind::Folder && !tl.layer_hidden(li, include_hidden) && tl.layer_is_masked_by(li).is_none()
         })
         .collect()
 }
@@ -1207,7 +1221,7 @@ impl XflDocument {
         used: &mut HashMap<String, usize>,
         depth: usize,
     ) {
-        for unit in render_units(tl) {
+        for unit in render_units(tl, self.include_hidden_layers) {
             let layer = &tl.layers[unit];
             let base = format!("{prefix}{}", sanitize_id(&layer.name));
             // Раскрытие контейнера: обычный слой с одним символом "~...".
@@ -1436,6 +1450,26 @@ mod tests {
         assert_eq!(tl.frame_count(), 2);
         assert_eq!(tl.frame_labels(), vec![(0, "Front".to_string()), (1, "Side".to_string())]);
         assert_eq!(doc.main.frame_count(), 3);
+    }
+
+    #[test]
+    fn hidden_layers_are_published_like_animate_does_unless_turned_off() {
+        let dom = br##"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/"><timelines><DOMTimeline name="S"><layers>
+            <DOMLayer name="Fill" visible="false"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#214EC5"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+            <DOMLayer name="Ref" layerType="guide"><frames><DOMFrame index="0"><elements><DOMShape><fills><FillStyle index="1"><SolidColor color="#00FF00"/></FillStyle></fills><edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 200|0 0"/></edges></DOMShape></elements></DOMFrame></frames></DOMLayer>
+        </layers></DOMTimeline></timelines></DOMDocument>"##;
+        let mut files = FileMap::new();
+        files.insert("DOMDocument.xml".into(), dom.to_vec());
+        let mut doc = XflDocument::from_files("t".into(), &files).unwrap();
+        assert!(doc.include_hidden_layers, "по умолчанию Animate публикует скрытые слои");
+        let svg = doc.render_svg(None, 0).unwrap().svg;
+        assert!(svg.contains("#214ec5"), "скрытый слой должен рисоваться");
+        assert!(!svg.contains("#00ff00"), "направляющий — никогда");
+        doc.include_hidden_layers = false;
+        assert!(doc.render_svg(None, 0).is_none(), "с выключенной опцией скрытый слой пропадает");
+
+        files.insert("PublishSettings.xml".into(), b"<flash_profiles><PublishFlashProperties><InvisibleLayer>0</InvisibleLayer></PublishFlashProperties></flash_profiles>".to_vec());
+        assert!(!XflDocument::from_files("t".into(), &files).unwrap().include_hidden_layers, "настройка документа уважается");
     }
 
     #[test]
