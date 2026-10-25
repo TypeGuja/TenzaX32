@@ -1,0 +1,19 @@
+[package]
+name = "pony-studio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pony-core = { path = "../pony-core" }
+pony-render = { path = "../pony-render" }
+pony-script = { path = "../pony-script" }
+glam.workspace = true
+serde.workspace = true
+serde_json = "1"
+wry = "0.57"
+tao = "0.37"
+resvg = "0.44"
+usvg = "0.44"
+tiny-skia = "0.11"
+base64 = "0.22"
+image = { version = "0.24", default-features = false, features = ["png"] }
