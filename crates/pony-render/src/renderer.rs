@@ -444,7 +444,11 @@ impl Renderer {
         });
 
         let mut parts: Vec<_> = character.parts.values().collect();
-        parts.sort_by_key(|p| p.layer);
+        // При равном `layer` — по id: порядок обхода HashMap случаен от
+        // запуска к запуску, и части одного слоя (у демо-персонажа тело,
+        // крыло и хвост) раньше менялись местами — крыло то было видно,
+        // то пряталось под телом. Тот же порядок (layer, id) у таймлайна.
+        parts.sort_by(|a, b| a.layer.cmp(&b.layer).then_with(|| a.id.cmp(&b.id)));
 
         // Раздел 60 ТЗ (Masks/Clipping): модельная матрица КАЖДОЙ части
         // считается заранее, отдельным проходом — маскируемая часть должна
@@ -1096,14 +1100,4 @@ mod mask_gpu_tests {
         let center = pixel_at(&frame, width / 2, height / 2);
         assert!(center[3] > 200 && center != bg, "битая ссылка clip_by не должна скрывать часть, got {center:?}");
     }
-}
-
-
-
-fn corners(p: &egui::Painter, r: egui::Rect, c: f32, s: egui::Stroke) {
-    let (l, t, r2, b) = (r.left(), r.top(), r.right(), r.bottom());
-    [(l,t),(r2,t),(l,b),(r2,b)].iter().for_each(|&(x,y)| {
-        p.line_segment([(x, if y == t { y + c } else { y - c }).into(), (x, y).into()], s);
-        p.line_segment([(x, y).into(), (if x == l { x + c } else { x - c }, y).into()], s);
-    });
 }

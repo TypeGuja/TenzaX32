@@ -12,21 +12,21 @@ use crate::morph::MorphState;
 use crate::part::Part;
 use crate::skeleton::Skeleton;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Metadata {
     pub author: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PhysicsConfig {
     /// Кости, которые качаются пассивно (грива, хвост) — по имени кости
     /// и коэффициенту "мягкости" (0 = жёсткая, 1 = максимально свободная).
     pub soft_bones: HashMap<String, f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Character {
     pub name: String,
     pub version: String,

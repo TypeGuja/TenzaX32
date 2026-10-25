@@ -28,7 +28,7 @@ pub enum PartKind {
 
 /// Источник изображения части — растр или вектор.
 /// Оба поддерживаются, т.к. ТЗ (раздел 16) требует импорт PNG/SVG/PSD.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PartSource {
     Png { path: String },
     Vector { path: String },
@@ -44,7 +44,7 @@ pub enum PartSource {
     Mesh { path: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Part {
     pub id: String,
     pub kind: PartKind,

@@ -10,7 +10,7 @@ use crate::ik::{solve_two_bone_ik, IkConstraint};
 pub type BoneId = String;
 
 /// Локальная трансформация кости относительно родителя.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
 pub struct Transform2D {
     pub position: Vec2,
     /// В радианах.
@@ -28,7 +28,7 @@ impl Default for Transform2D {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bone {
     pub id: BoneId,
     pub parent: Option<BoneId>,
@@ -37,7 +37,7 @@ pub struct Bone {
     pub length: f32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Skeleton {
     pub bones: Vec<Bone>,
     /// Раздел 41 ТЗ: Two Bone IK-констрейнты (Hip->Knee->Hoof + target).
