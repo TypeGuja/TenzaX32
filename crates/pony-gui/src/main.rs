@@ -25,6 +25,8 @@
 //!
 //! Для автоматизированного скриншота под Xvfb: `PONY_GUI_AUTOEXIT_MS=<мс>`.
 
+mod file_dialog;
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -50,8 +52,37 @@ const SCENE_HEIGHT: u32 = 720;
 const FPS: f32 = 24.0;
 const MIN_STAGE_ZOOM: f32 = 0.05;
 const MAX_STAGE_ZOOM: f32 = 64.0;
-const ASSET_PATH: &str = "gui_character.asset";
 
+/// Пустой персонаж для нового документа: только корневая кость, без
+/// частей и анимаций. Редактор открывается с ним (раньше — с демо-пони).
+fn empty_character() -> Character {
+    let mut character = Character::new("Новый персонаж");
+    character.skeleton.add_bone(pony_core::skeleton::Bone {
+        id: "Root".into(),
+        parent: None,
+        local_transform: pony_core::skeleton::Transform2D::default(),
+        length: 0.0,
+    });
+    character
+}
+
+/// Кость, к которой цеплять новые части (импорт, пустой слой, рисунок):
+/// "Body", если она есть (демо-пони), иначе корневая — у пустого
+/// персонажа и паппетов из Animate кости "Body" нет.
+fn default_bone(character: &Character) -> String {
+    if character.skeleton.find("Body").is_some() {
+        return "Body".into();
+    }
+    character
+        .skeleton
+        .bones
+        .iter()
+        .find(|b| b.parent.is_none())
+        .map(|b| b.id.clone())
+        .unwrap_or_else(|| "Root".into())
+}
+
+/// Демо-персонаж (File > Демо-пони): части из assets/ и анимация "Walk".
 fn build_walking_pony() -> Character {
     let mut character = Character::new("GuiPony");
     character.skeleton = default_pony_skeleton();
@@ -807,6 +838,10 @@ enum Action {
     InsertKeyframe,
     ExportGif,
     ExportSpritesheet,
+    SaveAs,
+    DemoPony,
+    /// Загрузить `.asset` из `asset_path` (после выбора в проводнике).
+    OpenPath,
     /// Импорт выбранного в окне "Adobe Animate" символа/кадра как нового
     /// персонажа сцены.
     ImportXfl,
@@ -950,6 +985,17 @@ fn take_blink(character: &mut Character, blink_timer: &mut f32) {
     if character.default_morph.get("Blink") > 0.0 {
         character.default_morph.set("Blink", 0.0);
         *blink_timer = BLINK_SECONDS;
+    }
+}
+
+/// Имя файла по умолчанию из имени персонажа/анимации: без символов,
+/// которые запрещены в именах файлов на Windows.
+fn file_stem_for(name: &str) -> String {
+    let s: String = name.trim().chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect();
+    if s.is_empty() {
+        "pony".into()
+    } else {
+        s
     }
 }
 
@@ -1577,14 +1623,15 @@ fn export_animation_gif(
     anim_name: Option<&str>,
     camera: &pony_core::Camera,
     lighting: &pony_core::Lighting,
+    path: &str,
 ) -> String {
     let frames = match render_animation_frames(renderer, ctx, character, anim_name, camera, lighting) {
         Ok(f) => f,
         Err(msg) => return format!("Экспорт GIF не выполнен: {msg}"),
     };
     let delay_cs = (100.0 / EXPORT_FPS).round() as u16;
-    match export_gif("gui_export.gif", &frames, delay_cs) {
-        Ok(()) => format!("GIF сохранён: gui_export.gif ({} кадров)", frames.len()),
+    match export_gif(path, &frames, delay_cs) {
+        Ok(()) => format!("GIF сохранён: {path} ({} кадров)", frames.len()),
         Err(err) => format!("Ошибка экспорта GIF: {err}"),
     }
 }
@@ -1596,13 +1643,14 @@ fn export_animation_spritesheet(
     anim_name: Option<&str>,
     camera: &pony_core::Camera,
     lighting: &pony_core::Lighting,
+    path: &str,
 ) -> String {
     let frames = match render_animation_frames(renderer, ctx, character, anim_name, camera, lighting) {
         Ok(f) => f,
         Err(msg) => return format!("Экспорт спрайт-листа не выполнен: {msg}"),
     };
-    match export_spritesheet("gui_export_sheet.png", &frames, 6) {
-        Ok(layout) => format!("Спрайт-лист сохранён: gui_export_sheet.png ({}x{} кадров)", layout.columns, layout.rows),
+    match export_spritesheet(path, &frames, 6) {
+        Ok(layout) => format!("Спрайт-лист сохранён: {path} ({}x{} кадров)", layout.columns, layout.rows),
         Err(err) => format!("Ошибка экспорта спрайт-листа: {err}"),
     }
 }
@@ -1683,10 +1731,8 @@ fn main() {
     let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None);
     let mut egui_renderer = egui_wgpu::Renderer::new(&gpu_ctx.device, surface_format, None, 1);
 
-    let mut character = build_walking_pony();
+    let mut character = empty_character();
     let mut player = AnimationPlayer::new();
-    player.play("Walk");
-    player.apply(&mut character);
 
     // --- сцена из нескольких персонажей ---
     // Намеренно НЕ переписываю все существующие обращения к `character`/
@@ -1769,10 +1815,13 @@ fn main() {
     let mut pencil_points: Vec<(f32, f32)> = Vec::new();
     let mut svg_save_count: u32 = 0;
     // Импорт ассетов из GUI (см. меню File > Import asset as layer).
-    let mut import_path = String::from("assets/pony/body.png");
     let mut import_count: u32 = 0;
-    // Путь .asset для File > Open/Save (редактируемый в меню File).
-    let mut asset_path = String::from(ASSET_PATH);
+    // Путь текущего документа (.asset); пусто — документ ещё не сохранён,
+    // и Save откроет проводник (Save As).
+    let mut asset_path = String::new();
+    let mut file_dialog = file_dialog::FileDialog::default();
+    // Выбранный в проводнике .asset, который ещё предстоит загрузить.
+    let mut pending_open = String::new();
     // Очередь действий из меню/тулбара/горячих клавиш — см. `Action`.
     let mut actions: Vec<Action> = Vec::new();
     // Запрос подогнать вид Stage — выполняется в CentralPanel, где
@@ -1988,14 +2037,17 @@ fn main() {
                             }
 
                             let raw_input = egui_state.take_egui_input(&window);
+                            let mut dialog_result: Option<file_dialog::DialogResult> = None;
                             let full_output = egui_ctx.run(raw_input, |ctx| {
                                 // --- горячие клавиши (раньше их не было вовсе, даже
                                 // Ctrl+Z/Ctrl+S). Пока фокус в текстовом поле
                                 // (скрипт, имя кости, путь) — не перехватываем,
                                 // чтобы Space/буквы/Backspace печатались. ---
-                                if !ctx.wants_keyboard_input() {
+                                // Пока открыт проводник, клавиши принадлежат ему.
+                                if !ctx.wants_keyboard_input() && !file_dialog.is_open() {
                                     use egui::{Key, KeyboardShortcut, Modifiers};
                                     let shortcuts = [
+                                        (KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::S), Action::SaveAs),
                                         (KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z), Action::Redo),
                                         (KeyboardShortcut::new(Modifiers::COMMAND, Key::Z), Action::Undo),
                                         (KeyboardShortcut::new(Modifiers::COMMAND, Key::Y), Action::Redo),
@@ -2109,7 +2161,7 @@ fn main() {
                                                 actions.push(Action::New);
                                                 ui.close_menu();
                                             }
-                                            if ui.add(egui::Button::new("Open").shortcut_text("Ctrl+O")).clicked() {
+                                            if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).on_hover_text(".asset — персонаж; .fla/.xfl — импорт Adobe Animate").clicked() {
                                                 actions.push(Action::Open);
                                                 ui.close_menu();
                                             }
@@ -2117,74 +2169,35 @@ fn main() {
                                                 actions.push(Action::Save);
                                                 ui.close_menu();
                                             }
-                                            // Диалога выбора файла нет — путь .asset задаётся
-                                            // здесь (раньше был зашит намертво в gui_character.asset).
-                                            ui.horizontal(|ui| {
-                                                ui.label("Файл:");
-                                                ui.add(egui::TextEdit::singleline(&mut asset_path).desired_width(200.0));
-                                            });
-                                            ui.weak(".asset — персонаж; .fla/.xfl — откроется окно импорта Adobe Animate");
+                                            if ui.add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S")).clicked() {
+                                                actions.push(Action::SaveAs);
+                                                ui.close_menu();
+                                            }
+                                            ui.weak(if asset_path.is_empty() { "Документ ещё не сохранён".to_string() } else { format!("Файл: {asset_path}") });
+                                            ui.separator();
+                                            if ui.button("Демо-пони (пример)").on_hover_text("Открыть встроенного демо-персонажа с анимацией Walk").clicked() {
+                                                actions.push(Action::DemoPony);
+                                                ui.close_menu();
+                                            }
                                             ui.separator();
                                             if ui.button("Import Adobe Animate (.fla/.xfl)…").clicked() {
                                                 xfl_window_open = true;
+                                                if xfl_doc.is_none() {
+                                                    file_dialog.show_for(file_dialog::Purpose::ImportAnimate, None, "");
+                                                }
                                                 ui.close_menu();
                                             }
                                             ui.separator();
-                                            // Импорт ассетов: движок умеет PNG/SVG/PSD/KRA, но
-                                            // до этого добраться до них из GUI было нельзя
-                                            // вообще — форматы работали только если прописать
-                                            // PartSource руками в коде. Диалога выбора файла
-                                            // нет (`rfd` не собирается в этой песочнице, см.
-                                            // README), поэтому импорт идёт по фиксированному
-                                            // пути из поля ниже — не идеально, но реально
-                                            // работает и честно об этом говорит.
-                                            ui.menu_button("Import asset as layer", |ui| {
-                                                ui.label("Путь к файлу (относительно рабочей папки):");
-                                                ui.add(egui::TextEdit::singleline(&mut import_path).desired_width(260.0));
-                                                let ext = std::path::Path::new(&import_path)
-                                                    .extension()
-                                                    .and_then(|e| e.to_str())
-                                                    .unwrap_or("")
-                                                    .to_lowercase();
-                                                let source = match ext.as_str() {
-                                                    "png" => Some(pony_core::part::PartSource::Png { path: import_path.clone() }),
-                                                    "svg" => Some(pony_core::part::PartSource::Vector { path: import_path.clone() }),
-                                                    "psd" => Some(pony_core::part::PartSource::Psd { path: import_path.clone(), layer: None }),
-                                                    "kra" => Some(pony_core::part::PartSource::Kra { path: import_path.clone(), layer_file: None }),
-                                                    _ => None,
-                                                };
-                                                match &source {
-                                                    Some(_) => {
-                                                        ui.label(format!("Формат: {} — поддерживается", ext.to_uppercase()));
-                                                    }
-                                                    None => {
-                                                        ui.label("Поддерживаются: .png, .svg, .psd, .kra");
-                                                    }
-                                                }
-                                                if ui.add_enabled(source.is_some(), egui::Button::new("Импортировать")).clicked() {
-                                                    if let Some(source) = source {
-                                                        if !std::path::Path::new(&import_path).exists() {
-                                                            status_message = format!("Файл не найден: {import_path}");
-                                                        } else {
-                                                            import_count += 1;
-                                                            let part_id = unique_name(&format!("imported_{import_count}"), |c| character.parts.contains_key(c));
-                                                            character.add_part(
-                                                                pony_core::part::Part::new(&part_id, pony_core::part::PartKind::Custom, source)
-                                                                    .with_bone("Body")
-                                                                    .with_layer(20 + import_count as i32),
-                                                            );
-                                                            status_message = format!("Импортировано '{import_path}' как слой '{part_id}'");
-                                                        }
-                                                    }
-                                                    ui.close_menu();
-                                                }
-                                            });
+                                            if ui.button("Import image as layer…").on_hover_text("PNG, SVG, PSD, KRA — новый слой на текущем персонаже").clicked() {
+                                                file_dialog.show_for(file_dialog::Purpose::ImportLayer, None, "");
+                                                ui.close_menu();
+                                            }
                                             ui.separator();
-                                            if ui.button("Export GIF (текущая анимация)").clicked() {
+                                            if ui.button("Export GIF… (текущая анимация)").clicked() {
                                                 actions.push(Action::ExportGif);
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Export Spritesheet (текущая анимация)").clicked() {
+                                            if ui.button("Export Spritesheet… (текущая анимация)").clicked() {
                                                 actions.push(Action::ExportSpritesheet);
                                                 ui.close_menu();
                                             }
@@ -2326,7 +2339,7 @@ fn main() {
                                                         pony_core::part::PartKind::Custom,
                                                         pony_core::part::PartSource::Png { path: String::new() },
                                                     )
-                                                    .with_bone("Body")
+                                                    .with_bone(default_bone(&character))
                                                     .with_layer(max_layer + 1),
                                                 );
                                                 selected_layer = Some(id.clone());
@@ -2518,10 +2531,10 @@ fn main() {
                                         if ui.button("New").on_hover_text("Ctrl+N").clicked() {
                                             actions.push(Action::New);
                                         }
-                                        if ui.button("Open").on_hover_text(format!("Ctrl+O — {asset_path}")).clicked() {
+                                        if ui.button("Open").on_hover_text("Ctrl+O").clicked() {
                                             actions.push(Action::Open);
                                         }
-                                        if ui.button("Save").on_hover_text(format!("Ctrl+S — {asset_path}")).clicked() {
+                                        if ui.button("Save").on_hover_text(if asset_path.is_empty() { "Ctrl+S — выбрать, куда сохранить".to_string() } else { format!("Ctrl+S — {asset_path}") }).clicked() {
                                             actions.push(Action::Save);
                                         }
                                         ui.separator();
@@ -2532,7 +2545,7 @@ fn main() {
                                             actions.push(Action::Redo);
                                         }
                                         ui.separator();
-                                        if ui.button("Export GIF").on_hover_text("gui_export.gif — текущая анимация").clicked() {
+                                        if ui.button("Export GIF").on_hover_text("Сохранить текущую анимацию в GIF").clicked() {
                                             actions.push(Action::ExportGif);
                                         }
                                         ui.separator();
@@ -2705,7 +2718,7 @@ fn main() {
                                                             .as_ref()
                                                             .and_then(|id| character.parts.get(id))
                                                             .and_then(|p| p.bone.clone())
-                                                            .unwrap_or_else(|| "Body".to_string());
+                                                            .unwrap_or_else(|| default_bone(&character));
                                                         let bone_world = character.skeleton.world_transform_with_ik(&bone_id).unwrap_or_default();
                                                         let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
 
@@ -3804,7 +3817,10 @@ fn main() {
                                     egui::Window::new("Импорт Adobe Animate").open(&mut open).default_width(640.0).default_pos(egui::pos2(220.0, 70.0)).show(ctx, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("Файл .fla / .xfl / папка XFL:");
-                                            let r = ui.add(egui::TextEdit::singleline(&mut xfl_path).desired_width(330.0).hint_text("../alkash3d-engine/assets/mlp/fla/....fla"));
+                                            let r = ui.add(egui::TextEdit::singleline(&mut xfl_path).desired_width(260.0).hint_text("путь к .fla / .xfl"));
+                                            if ui.button("Обзор…").clicked() {
+                                                file_dialog.show_for(file_dialog::Purpose::ImportAnimate, (!xfl_path.is_empty()).then(|| std::path::Path::new(xfl_path.as_str())), "");
+                                            }
                                             if ui.button("Загрузить").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                                                 xfl_load_request = true;
                                             }
@@ -3813,7 +3829,7 @@ fn main() {
                                             ui.small(&xfl_info);
                                         }
                                         let Some(doc) = &xfl_doc else {
-                                            ui.weak("Диалога выбора файла нет — впиши путь (относительно папки запуска или абсолютный) и нажми «Загрузить».");
+                                            ui.weak("Выбери файл кнопкой «Обзор…» (или впиши путь и нажми «Загрузить»).");
                                             return;
                                         };
                                         ui.separator();
@@ -3905,6 +3921,10 @@ fn main() {
                                     xfl_window_open = open;
                                 }
 
+                                if let Some(result) = file_dialog.ui(ctx) {
+                                    dialog_result = Some(result);
+                                }
+
                                 // Timeline — TopBottomPanel::bottom, но добавлена ЗДЕСЬ,
                                 // после боковых панелей, а не раньше них. Раньше стояла
                                 // перед SidePanel::left/right — из-за чего при своей
@@ -3933,11 +3953,10 @@ fn main() {
                                                 new_character_count += 1;
                                                 let new_name = format!("Pony {new_character_count}");
                                                 other_characters.push(CharacterSlot {
-                                                    character: std::mem::replace(&mut character, build_walking_pony()),
+                                                    character: std::mem::replace(&mut character, empty_character()),
                                                     player: std::mem::replace(&mut player, AnimationPlayer::new()),
                                                     name: active_character_name.clone(),
                                                 });
-                                                player.play("Walk");
                                                 active_character_name = new_name;
                                                 selected_layer = None;
                                                 selected_bone = None;
@@ -4076,6 +4095,8 @@ fn main() {
                                                     let v = glam::Vec2::new(c.x * cr + c.y * sr, -c.x * sr + c.y * cr) * camera.zoom * stage_zoom;
                                                     stage_pan = egui::vec2(-v.x, v.y);
                                                 } else {
+                                                    // Персонаж пуст — показываем весь документ.
+                                                    stage_zoom = (canvas_rect.width() / SCENE_WIDTH as f32).min(canvas_rect.height() / SCENE_HEIGHT as f32) * 0.95;
                                                     stage_pan = egui::Vec2::ZERO;
                                                 }
                                             }
@@ -4833,20 +4854,84 @@ fn main() {
                                 needs_redraw = true;
                             }
 
+                            // --- результат проводника ---
+                            if let Some(result) = dialog_result.take() {
+                                use file_dialog::Purpose;
+                                let path_str = result.path.to_string_lossy().into_owned();
+                                let ext = result.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                                match result.purpose {
+                                    Purpose::OpenDocument if ext == "fla" || ext == "xfl" || result.path.is_dir() => {
+                                        xfl_path = path_str;
+                                        xfl_load_request = true;
+                                    }
+                                    Purpose::ImportAnimate => {
+                                        xfl_path = path_str;
+                                        xfl_load_request = true;
+                                    }
+                                    Purpose::OpenDocument => {
+                                        pending_open = path_str;
+                                        actions.insert(0, Action::OpenPath);
+                                    }
+                                    Purpose::SaveDocument => {
+                                        asset_path = path_str;
+                                        actions.insert(0, Action::Save);
+                                    }
+                                    Purpose::ImportLayer => {
+                                        let source = match ext.as_str() {
+                                            "png" => Some(PartSource::Png { path: path_str.clone() }),
+                                            "svg" => Some(PartSource::Vector { path: path_str.clone() }),
+                                            "psd" => Some(PartSource::Psd { path: path_str.clone(), layer: None }),
+                                            "kra" => Some(PartSource::Kra { path: path_str.clone(), layer_file: None }),
+                                            _ => None,
+                                        };
+                                        match source {
+                                            Some(source) => {
+                                                import_count += 1;
+                                                let stem = result.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("imported_{import_count}"));
+                                                let part_id = unique_name(&stem, |c| character.parts.contains_key(c));
+                                                let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
+                                                character.add_part(Part::new(&part_id, PartKind::Custom, source).with_bone(default_bone(&character)).with_layer(max_layer + 1));
+                                                selected_layer = Some(part_id.clone());
+                                                fit_request = Some(FitView::Character);
+                                                status_message = format!("Импортировано '{path_str}' как слой '{part_id}'");
+                                            }
+                                            None => status_message = format!("Неподдерживаемый формат: {path_str} (нужны .png, .svg, .psd, .kra)"),
+                                        }
+                                    }
+                                    Purpose::ExportGif | Purpose::ExportSpritesheet => {
+                                        // Экспортируется то, что видно: скрытые в редакторе слои
+                                        // и группы раньше всё равно попадали в GIF/спрайт-лист.
+                                        let mut visible = character.clone();
+                                        visible.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
+                                        status_message = if result.purpose == Purpose::ExportGif {
+                                            export_animation_gif(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting, &path_str)
+                                        } else {
+                                            export_animation_spritesheet(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting, &path_str)
+                                        };
+                                    }
+                                }
+                                needs_redraw = true;
+                            }
+
                             // --- действия из меню/тулбара/горячих клавиш ---
                             for action in actions.drain(..) {
                                 match action {
-                                    // File > Open с путём к .fla/.xfl или папке XFL — это
-                                    // документ Adobe Animate, а не .asset: открываем окно импорта.
-                                    Action::Open
-                                        if std::path::Path::new(asset_path.trim()).is_dir()
-                                            || std::path::Path::new(asset_path.trim())
-                                                .extension()
-                                                .and_then(|e| e.to_str())
-                                                .is_some_and(|e| e.eq_ignore_ascii_case("fla") || e.eq_ignore_ascii_case("xfl")) =>
-                                    {
-                                        xfl_path = asset_path.trim().to_string();
-                                        xfl_load_request = true;
+                                    Action::Open => {
+                                        let start = (!asset_path.is_empty()).then(|| std::path::PathBuf::from(&asset_path));
+                                        file_dialog.show_for(file_dialog::Purpose::OpenDocument, start.as_deref(), "");
+                                    }
+                                    Action::SaveAs => {
+                                        let start = (!asset_path.is_empty()).then(|| std::path::PathBuf::from(&asset_path));
+                                        file_dialog.show_for(file_dialog::Purpose::SaveDocument, start.as_deref(), &format!("{}.asset", file_stem_for(&active_character_name)));
+                                    }
+                                    Action::Save if asset_path.is_empty() => {
+                                        file_dialog.show_for(file_dialog::Purpose::SaveDocument, None, &format!("{}.asset", file_stem_for(&active_character_name)));
+                                    }
+                                    Action::ExportGif | Action::ExportSpritesheet => {
+                                        let (purpose, ext) = if action == Action::ExportGif { (file_dialog::Purpose::ExportGif, "gif") } else { (file_dialog::Purpose::ExportSpritesheet, "png") };
+                                        let start = (!asset_path.is_empty()).then(|| std::path::PathBuf::from(&asset_path));
+                                        let anim = player.current_name().unwrap_or("animation").to_string();
+                                        file_dialog.show_for(purpose, start.as_deref(), &format!("{}_{}.{ext}", file_stem_for(&active_character_name), file_stem_for(&anim)));
                                     }
                                     Action::ImportXfl => {
                                         let Some(doc) = &xfl_doc else { continue };
@@ -4890,8 +4975,9 @@ fn main() {
                                             Err(err) => status_message = format!("Импорт не удался: {err}"),
                                         }
                                     }
-                                    Action::New => {
-                                        character = build_walking_pony();
+                                    Action::New | Action::DemoPony => {
+                                        character = if action == Action::DemoPony { build_walking_pony() } else { empty_character() };
+                                        asset_path.clear();
                                         pick_default_animation(&character, &mut player);
                                         player.apply(&mut character);
                                         playing = false;
@@ -4904,10 +4990,14 @@ fn main() {
                                         hidden_layers.clear();
                                         locked_layers.clear();
                                         fit_request = Some(FitView::Character);
-                                        status_message = "Новый персонаж (Ctrl+Z — вернуть предыдущего)".into();
+                                        status_message = if action == Action::DemoPony { "Демо-пони (Ctrl+Z — вернуть предыдущего)".into() } else { "Новый пустой персонаж (Ctrl+Z — вернуть предыдущего)".into() };
                                     }
-                                    Action::Open => match Character::load_from_file(&asset_path) {
+                                    Action::OpenPath => match Character::load_from_file(&pending_open) {
                                         Ok(loaded) => {
+                                            // Путь документа меняется только после успешной
+                                            // загрузки: иначе Ctrl+S после ошибки перезаписал бы
+                                            // нечитаемый файл текущим персонажем.
+                                            asset_path = std::mem::take(&mut pending_open);
                                             character = loaded;
                                             // Раньше после Open плеер оставался пустым: таймлайн
                                             // показывал пустую сетку, и ключи было некуда ставить.
@@ -4924,7 +5014,7 @@ fn main() {
                                             fit_request = Some(FitView::Character);
                                             status_message = format!("Загружено из {asset_path}");
                                         }
-                                        Err(err) => status_message = format!("Ошибка загрузки {asset_path}: {err}"),
+                                        Err(err) => status_message = format!("Ошибка загрузки {pending_open}: {err}"),
                                     },
                                     Action::Save => {
                                         status_message = match character.save_to_file(&asset_path) {
@@ -5011,17 +5101,6 @@ fn main() {
                                             (None, _) => status_message = "Сначала выбери слой (на Stage или в Timeline)".into(),
                                         }
                                     }
-                                    Action::ExportGif | Action::ExportSpritesheet => {
-                                        // Экспортируется то, что видно: скрытые в редакторе слои
-                                        // и группы раньше всё равно попадали в GIF/спрайт-лист.
-                                        let mut visible = character.clone();
-                                        visible.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
-                                        status_message = if action == Action::ExportGif {
-                                            export_animation_gif(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
-                                        } else {
-                                            export_animation_spritesheet(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
-                                        };
-                                    }
                                 }
                                 needs_redraw = true;
                             }
@@ -5031,7 +5110,8 @@ fn main() {
                                 needs_redraw = true;
                             }
                             let dirty = history.revision != saved_revision;
-                            let title = format!("pony-engine — {active_character_name} — {asset_path}{}", if dirty { " *" } else { "" });
+                            let doc_name = if asset_path.is_empty() { "Без имени".to_string() } else { asset_path.clone() };
+                            let title = format!("pony-engine — {active_character_name} — {doc_name}{}", if dirty { " *" } else { "" });
                             if title != window_title {
                                 window.set_title(&title);
                                 window_title = title;
