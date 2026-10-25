@@ -218,18 +218,54 @@ fn part_model_matrix(part: &pony_core::part::Part, character: &Character) -> Mat
     let size = part_render_size(part);
     let part_pos = part_world_position(part, &world);
 
-    let depth_z = -(part.layer as f32) * DEPTH_PER_LAYER;
+    let depth_z = part_depth(character, part);
     let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
+    let morph = part_morph_scale(character, part);
 
     // Доводка pony.Look() (раздел 7 ТЗ): поворот глаза через морфинг, не
     // всей кости головы — применяется только к частям вида Eyes.
     let eye_rotation = if part.kind == PartKind::Eyes { character.default_morph.eyes.rotation } else { 0.0 };
 
     Mat4::from_scale_rotation_translation(
-        glam::Vec3::new(world.scale.x * size.x * foreshorten, world.scale.y * size.y, 1.0),
+        glam::Vec3::new(world.scale.x * size.x * foreshorten * morph.x, world.scale.y * size.y * morph.y, 1.0),
         glam::Quat::from_rotation_z(world.rotation + eye_rotation),
         glam::Vec3::new(yawed_x, part_pos.y, 0.0),
     )
+}
+
+/// Глубина части для 2.5D-поворота (`apply_yaw_2_5d`). Номер слоя — это
+/// порядок отрисовки; у демо-пони слоёв 3-4, а у паппета из Adobe Animate
+/// их 20-30, и с прежними 8 единицами на слой при повороте персонажа части
+/// разлетались на сотни пикселей. Поэтому вся глубина персонажа не больше
+/// `3 * DEPTH_PER_LAYER`: при небольшом числе слоёв всё как раньше, при
+/// большом шаг на слой уменьшается.
+pub fn part_depth(character: &Character, part: &pony_core::part::Part) -> f32 {
+    let (min, max) = character.parts.values().fold((i32::MAX, i32::MIN), |(lo, hi), p| (lo.min(p.layer), hi.max(p.layer)));
+    let span = (max - min).max(0) as f32;
+    let per_layer = if span > 3.0 { DEPTH_PER_LAYER * 3.0 / span } else { DEPTH_PER_LAYER };
+    -(part.layer as f32) * per_layer
+}
+
+/// Масштаб части от выражений лица (`MorphState`), раньше рендером не
+/// читавшихся вовсе — `pony.Blink()`/`pony.Smile()` ничего не меняли на
+/// экране. Глаза (`PartKind::Eyes`): `Blink` сплющивает по вертикали (1 —
+/// глаз закрыт), `Wide` и `eyes.radius` увеличивают, `eyes.height` тянет по
+/// вертикали. Рот (`PartKind::Mouth`): `Smile` растягивает в ширину и
+/// чуть сплющивает, `Open` открывает по вертикали, `Sad` сужает.
+pub fn part_morph_scale(character: &Character, part: &pony_core::part::Part) -> glam::Vec2 {
+    let m = &character.default_morph;
+    match part.kind {
+        PartKind::Eyes => {
+            let r = m.eyes.radius * (1.0 + 0.3 * m.get("Wide"));
+            let blink = 1.0 - 0.92 * m.get("Blink").max(m.get("Sleep"));
+            glam::Vec2::new(r, r * m.eyes.height * blink)
+        }
+        PartKind::Mouth => {
+            let smile = m.get("Smile");
+            glam::Vec2::new((1.0 + 0.35 * smile) * (1.0 - 0.2 * m.get("Sad")), (1.0 - 0.25 * smile) * (1.0 + 1.5 * m.get("Open")))
+        }
+        _ => glam::Vec2::ONE,
+    }
 }
 
 /// Какой загрузчик текстуры использовать для источника части.
@@ -444,7 +480,11 @@ impl Renderer {
         });
 
         let mut parts: Vec<_> = character.parts.values().collect();
-        parts.sort_by_key(|p| p.layer);
+        // При равном `layer` — по id: порядок обхода HashMap случаен от
+        // запуска к запуску, и части одного слоя (у демо-персонажа тело,
+        // крыло и хвост) раньше менялись местами — крыло то было видно,
+        // то пряталось под телом. Тот же порядок (layer, id) у таймлайна.
+        parts.sort_by(|a, b| a.layer.cmp(&b.layer).then_with(|| a.id.cmp(&b.id)));
 
         // Раздел 60 ТЗ (Masks/Clipping): модельная матрица КАЖДОЙ части
         // считается заранее, отдельным проходом — маскируемая часть должна
@@ -893,6 +933,34 @@ mod part_placement_tests {
     use pony_core::part::{Part, PartKind, PartSource};
     use pony_core::skeleton::Transform2D;
 
+    #[test]
+    fn blink_squashes_eyes_and_smile_widens_mouth() {
+        let mut c = Character::new("m");
+        let eye = Part::new("eye", PartKind::Eyes, PartSource::Png { path: String::new() });
+        let mouth = Part::new("mouth", PartKind::Mouth, PartSource::Png { path: String::new() });
+        let body = Part::new("body", PartKind::Body, PartSource::Png { path: String::new() });
+        assert_eq!(part_morph_scale(&c, &eye), glam::Vec2::ONE);
+        c.default_morph.set("Blink", 1.0);
+        c.default_morph.set("Smile", 1.0);
+        assert!(part_morph_scale(&c, &eye).y < 0.2, "закрытый глаз должен быть сплющен");
+        assert!(part_morph_scale(&c, &mouth).x > 1.2, "улыбка растягивает рот");
+        assert_eq!(part_morph_scale(&c, &body), glam::Vec2::ONE, "выражения не трогают тело");
+    }
+
+    #[test]
+    fn depth_span_is_bounded_for_many_layers_but_unchanged_for_few() {
+        let mut c = Character::new("d");
+        for l in 0..3 {
+            c.add_part(Part::new(format!("p{l}"), PartKind::Custom, PartSource::Png { path: String::new() }).with_layer(l));
+        }
+        assert_eq!(part_depth(&c, &c.parts["p2"]), -2.0 * DEPTH_PER_LAYER, "мало слоёв — как раньше");
+        for l in 3..30 {
+            c.add_part(Part::new(format!("p{l}"), PartKind::Custom, PartSource::Png { path: String::new() }).with_layer(l));
+        }
+        let deepest = part_depth(&c, &c.parts["p29"]);
+        assert!(deepest.abs() <= 3.0 * DEPTH_PER_LAYER + 1e-4, "глубина паппета из 30 слоёв ограничена, got {deepest}");
+    }
+
     fn test_part(pivot: glam::Vec2) -> Part {
         Part::new("p", PartKind::Custom, PartSource::Png { path: String::new() }).with_pivot(pivot)
     }
@@ -1096,14 +1164,4 @@ mod mask_gpu_tests {
         let center = pixel_at(&frame, width / 2, height / 2);
         assert!(center[3] > 200 && center != bg, "битая ссылка clip_by не должна скрывать часть, got {center:?}");
     }
-}
-
-
-
-fn corners(p: &egui::Painter, r: egui::Rect, c: f32, s: egui::Stroke) {
-    let (l, t, r2, b) = (r.left(), r.top(), r.right(), r.bottom());
-    [(l,t),(r2,t),(l,b),(r2,b)].iter().for_each(|&(x,y)| {
-        p.line_segment([(x, if y == t { y + c } else { y - c }).into(), (x, y).into()], s);
-        p.line_segment([(x, y).into(), (if x == l { x + c } else { x - c }, y).into()], s);
-    });
 }

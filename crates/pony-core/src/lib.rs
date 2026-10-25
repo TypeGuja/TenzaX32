@@ -15,6 +15,7 @@ pub mod particles;
 pub mod player;
 pub mod skeleton;
 pub mod vector;
+pub mod xfl;
 
 pub use boolean::{boolean_op, flatten_shape_to_contour, piece_to_shape, BooleanOp, BooleanPiece, BooleanResult};
 pub use camera::Camera;
@@ -26,6 +27,7 @@ pub use orientation::apply_yaw_2_5d;
 pub use particles::{Particle, ParticleEmitter, ParticleKind};
 pub use player::AnimationPlayer;
 pub use vector::{
+    Contour,
     gradient_t_at, resolve_symbol_instance, GradientDef, GradientKind, GradientStop, NodeType,
     PathNode, PathPointKind, RgbaColor, SymbolDef, VectorDoc, VectorParseError, VectorShape,
 };

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
 pub enum Interpolation {
     Linear,
     Bezier { c1: (f32, f32), c2: (f32, f32) },
@@ -14,13 +14,13 @@ pub enum Interpolation {
 
 /// Значение, которое анимируется. Расширяемо под трансформы, морфы,
 /// параметры камеры/света/частиц.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnimValue {
     Float(f32),
     Vec2(f32, f32),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     /// Время в секундах от начала анимации.
     pub time: f32,
@@ -30,7 +30,7 @@ pub struct Keyframe {
 }
 
 /// Что именно анимирует дорожка.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnimTarget {
     Bone { id: String, channel: BoneChannel },
     Morph { name: String },
@@ -47,7 +47,7 @@ pub enum BoneChannel {
     ScaleY,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub target: AnimTarget,
     pub keyframes: Vec<Keyframe>,
@@ -188,7 +188,7 @@ fn as_f32(v: &AnimValue) -> f32 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Animation {
     pub name: String,
     pub duration: f32,

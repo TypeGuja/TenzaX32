@@ -48,6 +48,8 @@ use winit::window::WindowBuilder;
 const SCENE_WIDTH: u32 = 960;
 const SCENE_HEIGHT: u32 = 720;
 const FPS: f32 = 24.0;
+const MIN_STAGE_ZOOM: f32 = 0.05;
+const MAX_STAGE_ZOOM: f32 = 64.0;
 const ASSET_PATH: &str = "gui_character.asset";
 
 fn build_walking_pony() -> Character {
@@ -61,10 +63,12 @@ fn build_walking_pony() -> Character {
         .add_part(Part::new("ear_l", PartKind::Ear, PartSource::Png { path: "assets/pony/ear.png".into() }).with_bone("EarL").with_layer(2))
         .add_part(Part::new("ear_r", PartKind::Ear, PartSource::Png { path: "assets/pony/ear.png".into() }).with_bone("EarR").with_layer(2))
         .add_part(Part::new("eye_l", PartKind::Eyes, PartSource::Png { path: "assets/pony/eye.png".into() }).with_bone("Head").with_layer(2))
-        .add_part(Part::new("leg_fl", PartKind::LegFL, PartSource::Png { path: "assets/pony/leg.png".into() }).with_bone("LowerLegFL").with_layer(0))
-        .add_part(Part::new("leg_fr", PartKind::LegFR, PartSource::Png { path: "assets/pony/leg.png".into() }).with_bone("LowerLegFR").with_layer(0))
-        .add_part(Part::new("wing_l", PartKind::Wing, PartSource::Vector { path: "assets/pony_svg/wing.svg".into() }).with_bone("Body").with_layer(0))
-        .add_part(Part::new("tail", PartKind::Tail, PartSource::Vector { path: "assets/pony_svg/tail.svg".into() }).with_bone("Body").with_layer(0))
+        .add_part(Part::new("leg_fl", PartKind::LegFL, PartSource::Png { path: "assets/pony/leg.png".into() }).with_bone("LowerLegFL").with_layer(-1))
+        .add_part(Part::new("leg_fr", PartKind::LegFR, PartSource::Png { path: "assets/pony/leg.png".into() }).with_bone("LowerLegFR").with_layer(-1))
+        // Крыло поверх тела, хвост и ноги — за ним. Раньше всё это было на
+        // одном слое 0 с телом, и порядок между ними решал случай.
+        .add_part(Part::new("wing_l", PartKind::Wing, PartSource::Vector { path: "assets/pony_svg/wing.svg".into() }).with_bone("Body").with_layer(1))
+        .add_part(Part::new("tail", PartKind::Tail, PartSource::Vector { path: "assets/pony_svg/tail.svg".into() }).with_bone("Body").with_layer(-1))
         .add_part(Part::new("mouth", PartKind::Mouth, PartSource::Vector { path: "assets/pony_svg/mouth.svg".into() }).with_bone("Head").with_layer(2));
 
     character.add_animation(Animation {
@@ -129,6 +133,29 @@ impl Tool {
             Tool::Zoom => "Zoom",
         }
     }
+
+    /// Подсказка для тултипа палитры и статус-бара: что делает инструмент
+    /// и его горячая клавиша (как в Animate).
+    fn hint(self) -> &'static str {
+        match self {
+            Tool::Selection => "Selection (V): клик — выбрать часть, тащить — двигать её",
+            Tool::SubSelection => "SubSelection (A): клик — выбрать фигуру холста, тащить узлы, Delete — удалить",
+            Tool::FreeTransform => "Free Transform (Q): тащить — двигать кость части, Shift — вращать вокруг её точки, Alt+клик — кость-родитель (вся голова)",
+            Tool::Lasso => "Lasso (L): рамкой выделить несколько частей (меню Edit — групповые операции)",
+            Tool::Pen => "Pen (P): клик — точка, клик по первой — замкнуть, Enter — закончить, Esc — отмена",
+            Tool::Pencil => "Pencil (Y): рисовать тонкой линией",
+            Tool::Brush => "Brush (B): рисовать толстой линией",
+            Tool::Line => "Line (N): тащить — отрезок",
+            Tool::Rectangle => "Rectangle (R): тащить — прямоугольник",
+            Tool::Oval => "Oval (O): тащить — эллипс",
+            Tool::PolyStar => "PolyStar: тащить от центра — правильный многоугольник",
+            Tool::PaintBucket => "Paint Bucket (K): клик по фигуре холста — залить цветом Fill",
+            Tool::InkBottle => "Ink Bottle (S): клик по фигуре холста — обводка цветом Stroke",
+            Tool::Eyedropper => "Eyedropper (I): клик — взять цвет со Stage в Fill",
+            Tool::Hand => "Hand (H): тащить — панорама (средняя кнопка работает в любом инструменте)",
+            Tool::Zoom => "Zoom (Z): клик — приблизить, правый клик — отдалить",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,18 +205,20 @@ impl RightTab {
 /// ключевые кадры — кружки в ячейках, плейхед. Один слой может не иметь
 /// собственной дорожки анимации (нормально, как в Animate — статичные слои).
 ///
-/// Реально рабочие взаимодействия с сеткой (не только просмотр):
-/// - Zoom — слайдер вверху, кадры становятся достаточно широкими, чтобы по
-///   ним было реально попасть мышью (раньше при длинной анимации ширина
-///   кадра падала до нескольких пикселей — отсюда и жалоба "работать с
-///   таймлайном нереально").
-/// - Клик по ПУСТОЙ клетке в строке слоя — новый ключевой кадр там (текущая
-///   Y-позиция кости слоя на момент клика).
-/// - Клик по СУЩЕСТВУЮЩЕМУ ключу — выбрать его (подсвечивается ярче).
-/// - Перетаскивание выбранного ключа — двигает его по времени, значение
-///   сохраняется (не сбрасывается на текущую позицию кости).
-/// - Delete/Backspace с выбранным ключом — удаляет его.
-/// - Перетаскивание/клик НЕ по ключу — как и раньше, скрабит плейхед.
+/// Взаимодействия с сеткой:
+/// - Клик по клетке — перейти на этот кадр (и выбрать слой строки). Раньше
+///   ЛЮБОЙ клик по пустой клетке создавал ключевой кадр — просто
+///   переставить плейхед, не насоряв ключами, было нельзя.
+/// - Двойной клик по клетке (или F6 / Insert > Keyframe) — ключевой кадр
+///   с текущим значением выбранного канала кости слоя.
+/// - Клик по существующему ключу — выбрать его; перетаскивание — сдвинуть
+///   по времени (значение сохраняется; на занятый кадр ключ не встаёт —
+///   раньше он молча затирал чужой ключ).
+/// - Delete/Backspace — удалить выбранный ключ (только когда фокус не в
+///   текстовом поле — раньше Backspace в редакторе скрипта удалял ключи).
+/// - Сетка показывает кадры и ПОСЛЕ конца анимации: двойной клик там
+///   ставит ключ и удлиняет анимацию (раньше клики зажимались на последнем
+///   кадре и удлинить анимацию с таймлайна было невозможно).
 #[allow(clippy::too_many_arguments)]
 fn timeline_widget(
     ui: &mut egui::Ui,
@@ -202,7 +231,52 @@ fn timeline_widget(
     timeline_zoom: &mut f32,
     selected_keyframe: &mut Option<(String, i64)>,
     timeline_channel: &mut BoneChannel,
+    selected_bone: &Option<String>,
 ) {
+    // --- шапка: какая анимация, её длительность/цикл, зум, канал ---
+    ui.horizontal(|ui| {
+        let mut names: Vec<String> = character.animations.keys().cloned().collect();
+        names.sort();
+        let current = player.current_name().map(str_to_owned);
+        ui.label("Анимация:");
+        let mut pick: Option<String> = None;
+        egui::ComboBox::from_id_source("timeline_anim").selected_text(current.clone().unwrap_or_else(|| "(нет)".into())).show_ui(ui, |ui| {
+            for name in &names {
+                if ui.selectable_label(current.as_deref() == Some(name.as_str()), name).clicked() {
+                    pick = Some(name.clone());
+                }
+            }
+        });
+        if let Some(name) = pick {
+            player.play(&name);
+            player.apply(character);
+            *selected_keyframe = None;
+        }
+        if ui.button("+").on_hover_text("Новая пустая анимация").clicked() {
+            let name = unique_animation_name(character);
+            character.add_animation(Animation { name: name.clone(), duration: 1.0, looping: true, tracks: Vec::new() });
+            player.play(&name);
+            *playing = false;
+            *selected_keyframe = None;
+        }
+        if let Some(anim) = current.as_deref().and_then(|n| character.animations.get_mut(n)) {
+            ui.add(egui::DragValue::new(&mut anim.duration).speed(0.01).clamp_range(1.0 / FPS..=600.0).suffix(" с").max_decimals(2))
+                .on_hover_text("Длительность анимации");
+            ui.checkbox(&mut anim.looping, "Loop");
+        }
+        ui.separator();
+        ui.label("Zoom:");
+        ui.add(egui::Slider::new(timeline_zoom, 0.25..=6.0).fixed_decimals(2));
+        ui.separator();
+        ui.label("Канал:");
+        egui::ComboBox::from_id_source("timeline_channel").selected_text(channel_label(*timeline_channel)).show_ui(ui, |ui| {
+            for ch in [BoneChannel::PositionX, BoneChannel::PositionY, BoneChannel::Rotation, BoneChannel::ScaleX, BoneChannel::ScaleY] {
+                ui.selectable_value(timeline_channel, ch, channel_label(ch));
+            }
+        });
+    });
+    ui.small("клик — перейти на кадр · двойной клик / F6 — ключ · тащить кружок — сдвинуть · Delete — удалить ключ · Space — play/pause · стрелки ◀/▶ — кадр");
+
     let anim_name = player.current_name().map(str_to_owned);
     let anim_data: Option<(f32, Vec<Track>)> = anim_name.as_deref().and_then(|n| character.animations.get(n)).map(|a| (a.duration, a.tracks.clone()));
     let (duration, tracks) = anim_data.unwrap_or((1.0, Vec::new()));
@@ -214,26 +288,27 @@ fn timeline_widget(
 
     // Дорожка привязывается к слою, если её AnimTarget::Bone указывает на
     // кость этого слоя. Дорожки без такой привязки (Morph/EyeParam/Camera)
-    // собираются в один дополнительный ряд "Прочее" внизу — в реальном
-    // Animate у морфинга/камеры тоже нет отдельного "слоя" на канвасе.
+    // собираются в один дополнительный ряд "Прочее" внизу.
     //
-    // Важно: НЕСКОЛЬКО частей могут ссылаться на ОДНУ и ту же кость (в
-    // демо-персонаже так и есть — "tail" и "body" обе висят на кости
-    // "Body"). Дорожка анимации привязана к кости, не к части — значит
-    // один и тот же ключевой кадр по смыслу относится сразу ко ВСЕМ таким
-    // частям. Раньше он показывался только в строке ПЕРВОЙ подходящей
-    // части — из-за чего клик по пустой клетке в строке "tail" реально
-    // создавал ключ (для кости Body, всё верно), но точка появлялась в
-    // строке "body", а не "tail" — выглядело как "клик попал не туда",
-    // хотя данные были правильными с самого начала. Теперь дорожка
-    // отображается на ВСЕХ строках, чьи части используют эту кость — это
-    // и есть правда о том, что реально анимируется.
+    // НЕСКОЛЬКО частей могут ссылаться на ОДНУ кость (в демо-персонаже
+    // "tail" и "body" обе висят на "Body") — дорожка привязана к кости, а не
+    // к части, поэтому показывается на ВСЕХ строках, чьи части используют
+    // эту кость: это и есть правда о том, что реально анимируется.
     //
-    // Показываем ТОЛЬКО дорожки выбранного канала (PositionX/Y, Rotation,
-    // ScaleX/Y — выбирается селектором выше сетки). Раньше канал был жёстко
-    // зашит на PositionY — анимировать поворот или горизонтальное движение
-    // было вообще нельзя было через таймлайн. Дорожки НЕ-костей (морфинг,
-    // камера) канала не имеют — остаются в "Прочее" независимо от выбора.
+    // Показываем ТОЛЬКО дорожки выбранного канала (селектор "Канал").
+    // Плюс строки для костей БЕЗ своих частей, если их анимируют или они
+    // выбраны: у импортированных из Animate паппетов это кости-контейнеры
+    // (вся голова) — иначе их ключи попадали в "Прочее" и не редактировались.
+    let used_bones: HashSet<&str> = character.parts.values().filter_map(|p| p.bone.as_deref()).collect();
+    let animated_bones: HashSet<&str> = tracks.iter().filter_map(|t| match &t.target {
+        AnimTarget::Bone { id, .. } => Some(id.as_str()),
+        _ => None,
+    }).collect();
+    for bone in &character.skeleton.bones {
+        if bone.parent.is_some() && !used_bones.contains(bone.id.as_str()) && (animated_bones.contains(bone.id.as_str()) || selected_bone.as_deref() == Some(bone.id.as_str())) {
+            layer_ids.push(format!("{BONE_ROW_PREFIX}{}", bone.id));
+        }
+    }
     let mut layer_frames: Vec<(String, Vec<i64>)> = layer_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     let mut misc_frames: Vec<i64> = Vec::new();
     for track in &tracks {
@@ -247,7 +322,7 @@ fn timeline_widget(
             Some(bid) => {
                 let mut any_matched = false;
                 for (lid, entry_frames) in layer_frames.iter_mut() {
-                    if character.parts[lid].bone.as_deref() == Some(bid) {
+                    if row_bone(character, lid).as_deref() == Some(bid) {
                         entry_frames.extend(frames.iter().copied());
                         any_matched = true;
                     }
@@ -276,50 +351,67 @@ fn timeline_widget(
         row_labels.push(("(Прочее: камера/морфы)".to_string(), None));
     }
 
-    ui.horizontal(|ui| {
-        ui.label("Zoom:");
-        ui.add(egui::Slider::new(timeline_zoom, 0.25..=6.0).fixed_decimals(2));
-        ui.separator();
-        ui.label("Канал:");
-        egui::ComboBox::from_id_source("timeline_channel").selected_text(channel_label(*timeline_channel)).show_ui(ui, |ui| {
-            for ch in [BoneChannel::PositionX, BoneChannel::PositionY, BoneChannel::Rotation, BoneChannel::ScaleX, BoneChannel::ScaleY] {
-                ui.selectable_value(timeline_channel, ch, channel_label(ch));
-            }
-        });
-        ui.separator();
-        ui.small("клик по пустой клетке — новый ключ · тащить кружок — сдвинуть по времени · Delete — удалить выбранный");
-    });
-
     let base_frame_w = 8.0;
     let frame_w = (base_frame_w * *timeline_zoom).max(1.5);
-    let delete_pressed = ui.ctx().input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+    let delete_pressed = !ui.ctx().wants_keyboard_input() && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
 
+    // Переход на кадр — общий для клика по ruler/клетке и скраба драгом.
+    // `seek`, а не `advance(target - current)`: у зацикленной анимации
+    // advance на ровно `duration` оборачивался в кадр 0.
+    let seek_to_frame = |character: &mut Character, player: &mut AnimationPlayer, playing: &mut bool, frame: i64| {
+        *playing = false;
+        player.seek(character, (frame.max(0) as f32 / FPS).min(duration));
+        player.apply(character);
+    };
+
+    // Вертикальная прокрутка — у персонажа может быть больше слоёв, чем
+    // помещается по высоте панели; раньше нижние строки просто обрезались.
+    egui::ScrollArea::vertical().id_source("timeline_rows_scroll").auto_shrink([false, false]).show(ui, |ui| {
     ui.horizontal_top(|ui| {
-        // --- Фиксированная колонка меток слоёв: не в ScrollArea, поэтому
-        // остаётся на месте при горизонтальной прокрутке сетки кадров. ---
+        // --- Фиксированная колонка меток слоёв: не в горизонтальной
+        // ScrollArea, поэтому остаётся на месте при прокрутке сетки кадров. ---
         let (label_rect, label_response) = ui.allocate_exact_size(egui::vec2(label_col_width, total_height), egui::Sense::click());
         let lp = ui.painter_at(label_rect);
         lp.rect_filled(label_rect, 0.0, egui::Color32::from_gray(20));
+        lp.text(
+            egui::pos2(label_rect.left() + 4.0, label_rect.top() + ruler_height / 2.0),
+            egui::Align2::LEFT_CENTER,
+            "👁  🔒  слой",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(130),
+        );
         for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
             let row_top = label_rect.top() + ruler_height + row_height * i as f32;
             let row_rect = egui::Rect::from_min_max(egui::pos2(label_rect.left(), row_top), egui::pos2(label_rect.right(), row_top + row_height));
             let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
             lp.rect_filled(row_rect, 0.0, bg);
 
-            let is_layer_row = frames_opt.is_some();
-            if is_layer_row {
+            let is_layer_row = frames_opt.is_some() && character.parts.contains_key(label);
+            if !is_layer_row && frames_opt.is_some() {
+                // строка кости-контейнера
+                if selected_bone.as_deref() == label.strip_prefix(BONE_ROW_PREFIX) {
+                    lp.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(70, 60, 30));
+                }
+                lp.text(
+                    egui::pos2(label_rect.left() + 6.0, row_top + row_height / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(230, 200, 120),
+                );
+            } else if is_layer_row {
                 if selected.as_deref() == Some(label.as_str()) {
                     lp.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(45, 65, 90));
                 }
                 let cb_rect = egui::Rect::from_min_size(egui::pos2(label_rect.left() + 4.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
                 let visible = !hidden.contains(label);
-                lp.rect_stroke(cb_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+                lp.rect_stroke(cb_rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150)));
                 if visible {
                     lp.rect_filled(cb_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(120, 170, 230));
                 }
                 let lock_rect = egui::Rect::from_min_size(egui::pos2(label_rect.left() + 20.0, row_top + row_height / 2.0 - 6.0), egui::vec2(12.0, 12.0));
                 let is_locked = locked.contains(label);
-                lp.rect_stroke(lock_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+                lp.rect_stroke(lock_rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150)));
                 if is_locked {
                     lp.rect_filled(lock_rect.shrink(2.5), 1.0, egui::Color32::from_rgb(230, 170, 90));
                 }
@@ -328,7 +420,7 @@ fn timeline_widget(
                     egui::Align2::LEFT_CENTER,
                     label,
                     egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(210),
+                    if visible { egui::Color32::from_gray(210) } else { egui::Color32::from_gray(110) },
                 );
             } else {
                 lp.text(
@@ -345,15 +437,15 @@ fn timeline_widget(
                 let row_i = ((pos.y - (label_rect.top() + ruler_height)) / row_height).floor() as i64;
                 if row_i >= 0 && (row_i as usize) < row_labels.len() {
                     let (label, frames_opt) = &row_labels[row_i as usize];
-                    if frames_opt.is_some() {
+                    if frames_opt.is_some() && character.parts.contains_key(label) {
                         let local_x = pos.x - label_rect.left();
-                        if (4.0..16.0).contains(&local_x) {
+                        if (2.0..18.0).contains(&local_x) {
                             if hidden.contains(label) {
                                 hidden.remove(label);
                             } else {
                                 hidden.insert(label.clone());
                             }
-                        } else if (20.0..32.0).contains(&local_x) {
+                        } else if (18.0..34.0).contains(&local_x) {
                             if locked.contains(label) {
                                 locked.remove(label);
                             } else {
@@ -369,7 +461,11 @@ fn timeline_widget(
 
         // --- Прокручиваемая сетка кадров ---
         egui::ScrollArea::horizontal().id_source("timeline_grid_scroll").auto_shrink([false, true]).show(ui, |ui| {
-            let grid_width = (total_frames as f32 * frame_w).max(ui.available_width());
+            // Сетка шире самой анимации: +1 секунда после конца (или до
+            // края панели) — туда можно поставить ключ и удлинить анимацию.
+            let min_frames = (ui.available_width() / frame_w).ceil() as i64;
+            let display_frames = (total_frames + FPS as i64).max(min_frames);
+            let grid_width = display_frames as f32 * frame_w;
             let (grid_rect, grid_response) = ui.allocate_exact_size(egui::vec2(grid_width, total_height), egui::Sense::click_and_drag());
             let gp = ui.painter_at(grid_rect);
             gp.rect_filled(grid_rect, 0.0, egui::Color32::from_gray(20));
@@ -377,24 +473,27 @@ fn timeline_widget(
             let ruler_rect = egui::Rect::from_min_max(grid_rect.min, egui::pos2(grid_rect.right(), grid_rect.top() + ruler_height));
             gp.rect_filled(ruler_rect, 0.0, egui::Color32::from_gray(32));
             let tick_every = if frame_w >= 14.0 { 1 } else { (14.0 / frame_w).ceil() as i64 }.max(1);
-            for f in (0..=total_frames).step_by(tick_every as usize) {
+            for f in (0..=display_frames).step_by(tick_every as usize) {
                 let x = grid_rect.left() + f as f32 * frame_w;
-                gp.line_segment([egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
+                gp.line_segment([egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)));
                 gp.text(egui::pos2(x + 2.0, ruler_rect.top() + 1.0), egui::Align2::LEFT_TOP, format!("{f}"), egui::FontId::proportional(9.0), egui::Color32::from_gray(160));
             }
 
+            let end_x = grid_rect.left() + total_frames as f32 * frame_w;
             for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
                 let row_top = grid_rect.top() + ruler_height + row_height * i as f32;
                 let row_rect = egui::Rect::from_min_max(egui::pos2(grid_rect.left(), row_top), egui::pos2(grid_rect.right(), row_top + row_height));
                 let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
                 gp.rect_filled(row_rect, 0.0, bg);
+                if selected.as_deref() == Some(label.as_str()) {
+                    gp.rect_filled(row_rect, 0.0, egui::Color32::from_rgba_unmultiplied(70, 100, 140, 50));
+                }
 
-                // Тонкая сетка кадров — видно, куда именно кликаешь, когда
-                // приближен зумом.
+                // Тонкая сетка кадров — видно, куда именно кликаешь.
                 if frame_w >= 4.0 {
-                    for f in 0..=total_frames {
+                    for f in 0..=display_frames {
                         let x = grid_rect.left() + f as f32 * frame_w;
-                        gp.line_segment([egui::pos2(x, row_top), egui::pos2(x, row_top + row_height)], egui::Stroke::new(0.5, egui::Color32::from_gray(30)));
+                        gp.line_segment([egui::pos2(x, row_top), egui::pos2(x, row_top + row_height)], egui::Stroke::new(0.5_f32, egui::Color32::from_gray(30)));
                     }
                 }
 
@@ -406,70 +505,57 @@ fn timeline_widget(
                     let r = if is_sel { 5.5 } else { 4.0 };
                     let col = if is_sel { egui::Color32::from_rgb(255, 230, 140) } else { egui::Color32::from_rgb(230, 190, 90) };
                     gp.circle_filled(egui::pos2(x, cy), r, col);
-                    gp.circle_stroke(egui::pos2(x, cy), r, egui::Stroke::new(if is_sel { 2.0 } else { 1.0 }, egui::Color32::from_rgb(120, 90, 30)));
+                    gp.circle_stroke(egui::pos2(x, cy), r, egui::Stroke::new(if is_sel { 2.0_f32 } else { 1.0_f32 }, egui::Color32::from_rgb(120, 90, 30)));
                 }
             }
+            // Всё, что после конца анимации, затемнено — видно, где она
+            // кончается, и что ключ там её удлинит.
+            gp.rect_filled(egui::Rect::from_min_max(egui::pos2(end_x, ruler_rect.bottom()), grid_rect.max), 0.0, egui::Color32::from_black_alpha(90));
+            gp.line_segment([egui::pos2(end_x, grid_rect.top()), egui::pos2(end_x, grid_rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 120, 160)));
 
             let current_frame = (player.time() * FPS).round().clamp(0.0, total_frames as f32);
-            let playhead_x = grid_rect.left() + current_frame * frame_w;
-            gp.line_segment([egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())], egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 80, 80)));
+            let playhead_x = grid_rect.left() + current_frame * frame_w + frame_w / 2.0;
+            gp.line_segment([egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())], egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(230, 80, 80)));
 
-            // Ищет ключ (строка, номер кадра) под точкой, если он там есть —
-            // общая логика для выбора и для решения "драг — это скраб или
-            // перетаскивание ключа".
+            let frame_at = |pos: egui::Pos2| -> i64 { (((pos.x - grid_rect.left()) / frame_w).floor() as i64).clamp(0, display_frames) };
+            let row_at = |pos: egui::Pos2| -> Option<usize> {
+                let row_i = ((pos.y - (grid_rect.top() + ruler_height)) / row_height).floor() as i64;
+                (pos.y >= grid_rect.top() + ruler_height && row_i >= 0 && (row_i as usize) < row_labels.len()).then_some(row_i as usize)
+            };
+
+            // Ищет ключ (строка, номер кадра) под точкой — общая логика для
+            // выбора и для решения "драг — это скраб или перетаскивание ключа".
             let keyframe_at = |pos: egui::Pos2| -> Option<(String, i64)> {
-                for (i, (label, frames_opt)) in row_labels.iter().enumerate() {
-                    let frames = frames_opt.as_deref()?;
-                    let row_top = grid_rect.top() + ruler_height + row_height * i as f32;
-                    let cy = row_top + row_height / 2.0;
-                    if (pos.y - cy).abs() > row_height / 2.0 {
-                        continue;
-                    }
-                    for &f in frames {
-                        let x = grid_rect.left() + f as f32 * frame_w + frame_w / 2.0;
-                        // Раньше радиус попадания был (frame_w/2).max(4).min(9) —
-                        // при обычном зуме (frame_w=8) это ровно 4px, и
-                        // перетаскивание ключа промахивалось мимо самого себя
-                        // при малейшей неточности клика (воспроизведено: клик
-                        // в 2px от центра точки уже не засчитывался). Кружок
-                        // рисуется радиусом 4-5.5px — hit-радиус должен быть
-                        // заметно ЩЕДРЕЕ видимого кружка, не around him.
-                        if (pos.x - x).abs() < (frame_w / 2.0).max(7.0).min(14.0) {
-                            return Some((label.clone(), f));
-                        }
-                    }
-                }
-                None
+                let i = row_at(pos)?;
+                let (label, frames_opt) = &row_labels[i];
+                let frames = frames_opt.as_deref()?;
+                // Hit-радиус заметно щедрее видимого кружка (4-5.5px).
+                frames
+                    .iter()
+                    .find(|&&f| (pos.x - (grid_rect.left() + f as f32 * frame_w + frame_w / 2.0)).abs() < (frame_w / 2.0).clamp(7.0, 14.0))
+                    .map(|&f| (label.clone(), f))
             };
 
             if grid_response.drag_started() {
-                // Важно: НЕ `grid_response.interact_pointer_pos()` — она
-                // может вернуть точку уже ПОСЛЕ того, как курсор отъехал от
-                // места нажатия (egui распознаёт "это драг" только после
-                // превышения порога сдвига, и к этому моменту сообщаемая
-                // позиция уже смещена от настоящего mousedown — при крупных
-                // скачках между событиями мыши, как в этой тестовой
-                // Xvfb-среде, разница доходила до 90px, и попытка
-                // перетащить ключ промахивалась мимо самого себя). Берём
-                // `press_origin()` — она хранит ИСХОДНУЮ точку нажатия на
-                // весь жест, независимо от того, где курсор оказался, когда
-                // сам факт "это драг" был распознан.
+                // `press_origin()`, а не `interact_pointer_pos()`: egui
+                // распознаёт драг только после порога сдвига, и к этому
+                // моменту позиция уже уехала от настоящего mousedown.
                 let pos = ui.input(|i| i.pointer.press_origin());
                 *selected_keyframe = pos.and_then(keyframe_at);
             }
 
             if grid_response.dragged() {
                 if let (Some((label, orig_frame)), Some(pos)) = (selected_keyframe.clone(), grid_response.interact_pointer_pos()) {
-                    // Тащим существующий ключ по времени — значение
-                    // сохраняем (не сбрасываем на текущую позицию кости).
-                    let new_frame = (((pos.x - grid_rect.left()) / frame_w).round() as i64).clamp(0, total_frames);
+                    // Тащим существующий ключ по времени — значение сохраняем.
+                    let new_frame = frame_at(pos);
                     if new_frame != orig_frame {
-                        if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
-                            if let Some(name) = &anim_name {
-                                if let Some(anim) = character.animations.get_mut(name) {
-                                    let old_t = orig_frame as f32 / FPS;
-                                    let new_t = new_frame as f32 / FPS;
-                                    if let Some(value) = remove_keyframe(anim, &bone_id, *timeline_channel, old_t) {
+                        if let (Some(bone_id), Some(name)) = (row_bone(character, &label), &anim_name) {
+                            if let Some(anim) = character.animations.get_mut(name) {
+                                let new_t = new_frame as f32 / FPS;
+                                // На занятый кадр не встаём — иначе insert
+                                // заменил бы чужой ключ, и он бы пропал.
+                                if !has_keyframe_at(anim, &bone_id, *timeline_channel, new_t) {
+                                    if let Some(value) = remove_keyframe(anim, &bone_id, *timeline_channel, orig_frame as f32 / FPS) {
                                         insert_keyframe(anim, &bone_id, *timeline_channel, new_t, value);
                                         *selected_keyframe = Some((label, new_frame));
                                     }
@@ -478,52 +564,53 @@ fn timeline_widget(
                         }
                     }
                 } else if let Some(pos) = grid_response.interact_pointer_pos() {
-                    // Не над ключом — как и раньше, перетаскивание скрабит
-                    // плейхед.
-                    if pos.x >= grid_rect.left() {
-                        let frac = ((pos.x - grid_rect.left()) / (total_frames as f32 * frame_w)).clamp(0.0, 1.0);
-                        let target_t = frac * duration;
-                        *playing = false;
-                        let current = player.time();
-                        player.advance(character, target_t - current);
-                        player.apply(character);
+                    // Не над ключом — перетаскивание скрабит плейхед.
+                    seek_to_frame(character, player, playing, frame_at(pos));
+                }
+            } else if grid_response.double_clicked() {
+                if let Some(pos) = grid_response.interact_pointer_pos() {
+                    if let Some(row_i) = row_at(pos) {
+                        let label = row_labels[row_i].0.clone();
+                        if row_labels[row_i].1.is_some() {
+                            if character.parts.contains_key(&label) {
+                                *selected = Some(label.clone());
+                            }
+                            match row_bone(character, &label) {
+                                Some(bone_id) => {
+                                    let frame = frame_at(pos);
+                                    let t = frame as f32 / FPS;
+                                    let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, *timeline_channel)).unwrap_or(0.0);
+                                    let name = ensure_animation(character, player);
+                                    if let Some(anim) = character.animations.get_mut(&name) {
+                                        insert_keyframe(anim, &bone_id, *timeline_channel, t, value);
+                                        *selected_keyframe = Some((label, frame));
+                                    }
+                                    seek_to_frame(character, player, playing, frame);
+                                }
+                                None => {}
+                            }
+                        }
                     }
                 }
             } else if grid_response.clicked() {
                 if let Some(pos) = grid_response.interact_pointer_pos() {
                     match keyframe_at(pos) {
-                        Some(hit) => *selected_keyframe = Some(hit),
+                        Some(hit) => {
+                            let frame = hit.1;
+                            if character.parts.contains_key(&hit.0) {
+                                *selected = Some(hit.0.clone());
+                            }
+                            *selected_keyframe = Some(hit);
+                            seek_to_frame(character, player, playing, frame);
+                        }
                         None => {
-                            let row_i = ((pos.y - (grid_rect.top() + ruler_height)) / row_height).floor() as i64;
-                            let in_layer_row = row_i >= 0 && (row_i as usize) < row_labels.len() && row_labels[row_i as usize].1.is_some();
-                            if in_layer_row && pos.y >= grid_rect.top() + ruler_height {
-                                // Пустая клетка в строке слоя — новый ключ
-                                // с текущим значением ВЫБРАННОГО канала
-                                // (Position X/Y, Rotation, Scale X/Y — см.
-                                // селектор "Канал" выше сетки) этой кости.
-                                let (label, _) = &row_labels[row_i as usize];
-                                let label = label.clone();
-                                if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
-                                    let frame = (((pos.x - grid_rect.left()) / frame_w).round() as i64).clamp(0, total_frames);
-                                    let t = frame as f32 / FPS;
-                                    let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, *timeline_channel)).unwrap_or(0.0);
-                                    if let Some(name) = &anim_name {
-                                        if let Some(anim) = character.animations.get_mut(name) {
-                                            insert_keyframe(anim, &bone_id, *timeline_channel, t, value);
-                                            *selected_keyframe = Some((label, frame));
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Ruler или строка "Прочее" — скраб.
-                                if pos.x >= grid_rect.left() {
-                                    let frac = ((pos.x - grid_rect.left()) / (total_frames as f32 * frame_w)).clamp(0.0, 1.0);
-                                    *playing = false;
-                                    let current = player.time();
-                                    player.advance(character, frac * duration - current);
-                                    player.apply(character);
+                            *selected_keyframe = None;
+                            if let Some(row_i) = row_at(pos) {
+                                if row_labels[row_i].1.is_some() && character.parts.contains_key(&row_labels[row_i].0) {
+                                    *selected = Some(row_labels[row_i].0.clone());
                                 }
                             }
+                            seek_to_frame(character, player, playing, frame_at(pos));
                         }
                     }
                 }
@@ -531,12 +618,10 @@ fn timeline_widget(
 
             if delete_pressed {
                 if let Some((label, frame)) = selected_keyframe.clone() {
-                    if let Some(bone_id) = character.parts.get(&label).and_then(|p| p.bone.clone()) {
-                        if let Some(name) = &anim_name {
-                            if let Some(anim) = character.animations.get_mut(name) {
-                                if remove_keyframe(anim, &bone_id, *timeline_channel, frame as f32 / FPS).is_some() {
-                                    *selected_keyframe = None;
-                                }
+                    if let (Some(bone_id), Some(name)) = (row_bone(character, &label), &anim_name) {
+                        if let Some(anim) = character.animations.get_mut(name) {
+                            if remove_keyframe(anim, &bone_id, *timeline_channel, frame as f32 / FPS).is_some() {
+                                *selected_keyframe = None;
                             }
                         }
                     }
@@ -544,6 +629,62 @@ fn timeline_widget(
             }
         });
     });
+    });
+}
+
+/// Префикс строки таймлайна для кости без собственной части.
+const BONE_ROW_PREFIX: &str = "кость: ";
+
+/// Кость, к которой относятся ключи строки таймлайна: у части — её кость,
+/// у строки-кости — сама кость.
+fn row_bone(character: &Character, label: &str) -> Option<String> {
+    match character.parts.get(label) {
+        Some(part) => part.bone.clone(),
+        None => label.strip_prefix(BONE_ROW_PREFIX).map(str::to_string),
+    }
+}
+
+/// Имя для новой анимации, не занятое у персонажа: "Animation",
+/// "Animation 2", ...
+fn unique_animation_name(character: &Character) -> String {
+    let mut n = 1;
+    loop {
+        let name = if n == 1 { "Animation".to_string() } else { format!("Animation {n}") };
+        if !character.animations.contains_key(&name) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// Имя текущей анимации; если играть нечего (у загруженного персонажа нет
+/// анимаций или ни одна не выбрана) — создаёт пустую и делает текущей.
+/// Без этого ключевые кадры молча не ставились: таймлайн выглядел живым,
+/// а клики по нему ничего не делали.
+fn ensure_animation(character: &mut Character, player: &mut AnimationPlayer) -> String {
+    if let Some(name) = player.current_name().filter(|n| character.animations.contains_key(*n)) {
+        return name.to_string();
+    }
+    let name = unique_animation_name(character);
+    character.add_animation(Animation { name: name.clone(), duration: 1.0, looping: true, tracks: Vec::new() });
+    player.play(&name);
+    name
+}
+
+/// Выбрать анимацию, с которой открывать персонажа: "Walk", если есть,
+/// иначе первая по алфавиту. Плеер ставится на кадр 0, без воспроизведения.
+fn pick_default_animation(character: &Character, player: &mut AnimationPlayer) {
+    *player = AnimationPlayer::new();
+    let name = if character.animations.contains_key("Walk") {
+        Some("Walk".to_string())
+    } else {
+        let mut names: Vec<&String> = character.animations.keys().collect();
+        names.sort();
+        names.first().map(|n| n.to_string())
+    };
+    if let Some(name) = name {
+        player.play(name);
+    }
 }
 
 fn color32_to_rgb(c: egui::Color32) -> [f32; 3] {
@@ -554,20 +695,262 @@ fn str_to_owned(s: &str) -> String {
     s.to_string()
 }
 
-/// Глубина истории отмены. Снимок — это полный клон `Character`, поэтому
-/// стек ограничен: 50 шагов на персонажа из десятка частей — единицы
-/// мегабайт, а не «пока не кончится память».
-const MAX_UNDO_DEPTH: usize = 50;
+/// Глубина истории отмены. Снимок — это полный клон `Character` + холста,
+/// поэтому стек ограничен: 100 шагов на персонажа из десятка частей —
+/// единицы мегабайт, а не «пока не кончится память».
+const MAX_UNDO_DEPTH: usize = 100;
 
-/// Положить текущее состояние персонажа в стек отмены. Вызывается ПЕРЕД
-/// мутацией. Redo при этом очищается — это стандартное поведение: после
-/// нового действия «вперёд» идти уже некуда.
-fn push_undo(undo: &mut Vec<pony_core::Character>, redo: &mut Vec<pony_core::Character>, character: &pony_core::Character) {
-    undo.push(character.clone());
-    if undo.len() > MAX_UNDO_DEPTH {
-        undo.remove(0);
+/// Снимок документа для Undo/Redo: персонаж + холст рисования (VectorDoc).
+/// Раньше в историю попадал только персонаж — нарисованную фигуру
+/// отменить было нельзя.
+#[derive(Clone, PartialEq)]
+struct DocState {
+    character: Character,
+    vector_doc: pony_core::VectorDoc,
+}
+
+/// История правок. Работает АВТОМАТИЧЕСКИ: в конце кадра, когда кнопки
+/// мыши отпущены, текущее состояние сравнивается с последним
+/// зафиксированным, и если оно другое — старое уходит в undo. Один жест
+/// (перетаскивание, правка поля) = один шаг отмены.
+///
+/// Раньше `push_undo` вызывался вручную в отдельных местах, и большая
+/// часть правок (ключи на таймлайне, поля Transform/Properties/Bones,
+/// перетаскивание кости, рисование, скрипт из вкладки Script) в историю не
+/// попадала вовсе — Ctrl+Z "работал через раз".
+///
+/// Поза, которую плеер пишет в кости при воспроизведении/скрабе, правкой
+/// НЕ считается: база перед сравнением прогоняется через тот же плеер.
+struct History {
+    undo: Vec<DocState>,
+    redo: Vec<DocState>,
+    committed: DocState,
+    /// Растёт на каждом изменении документа — по нему считается "есть
+    /// несохранённые правки" (звёздочка в заголовке окна).
+    revision: u64,
+}
+
+impl History {
+    fn new(character: &Character, vector_doc: &pony_core::VectorDoc) -> Self {
+        Self { undo: Vec::new(), redo: Vec::new(), committed: DocState { character: character.clone(), vector_doc: vector_doc.clone() }, revision: 0 }
     }
-    redo.clear();
+
+    /// Зафиксировать текущее состояние, если оно реально изменилось.
+    /// Возвращает true, если в историю добавлен шаг.
+    fn commit_if_changed(&mut self, character: &Character, vector_doc: &pony_core::VectorDoc, player: &AnimationPlayer) -> bool {
+        if self.committed.character == *character && self.committed.vector_doc == *vector_doc {
+            return false;
+        }
+        if self.committed.vector_doc == *vector_doc {
+            let mut posed = self.committed.character.clone();
+            player.apply(&mut posed);
+            if posed == *character {
+                // Изменилась только поза из анимации — подтягиваем базу,
+                // но шагом отмены это не является.
+                self.committed.character = character.clone();
+                return false;
+            }
+        }
+        let previous = std::mem::replace(&mut self.committed, DocState { character: character.clone(), vector_doc: vector_doc.clone() });
+        self.undo.push(previous);
+        if self.undo.len() > MAX_UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.revision += 1;
+        true
+    }
+
+    fn undo(&mut self, character: &Character, vector_doc: &pony_core::VectorDoc) -> Option<DocState> {
+        let prev = self.undo.pop()?;
+        self.redo.push(DocState { character: character.clone(), vector_doc: vector_doc.clone() });
+        self.committed = prev.clone();
+        self.revision += 1;
+        Some(prev)
+    }
+
+    fn redo(&mut self, character: &Character, vector_doc: &pony_core::VectorDoc) -> Option<DocState> {
+        let next = self.redo.pop()?;
+        self.undo.push(DocState { character: character.clone(), vector_doc: vector_doc.clone() });
+        self.committed = next.clone();
+        self.revision += 1;
+        Some(next)
+    }
+
+    /// Начать историю заново (переключение на другого персонажа сцены):
+    /// иначе Ctrl+Z подставил бы активному слоту состояние ДРУГОГО персонажа.
+    fn reset(&mut self, character: &Character, vector_doc: &pony_core::VectorDoc) {
+        self.undo.clear();
+        self.redo.clear();
+        self.committed = DocState { character: character.clone(), vector_doc: vector_doc.clone() };
+        self.revision += 1;
+    }
+}
+
+/// Действия, которые можно вызвать из меню, тулбара И горячих клавиш —
+/// выполняются в одном месте (см. `run_action` в main), чтобы кнопка
+/// "Open" на тулбаре и пункт меню File > Open не расходились в поведении
+/// (раньше тулбарные New/Open/Save молча игнорировали ошибки и не
+/// сбрасывали выделение/скрытые слои).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    New,
+    Open,
+    Save,
+    Undo,
+    Redo,
+    TogglePlay,
+    Rewind,
+    GoToEnd,
+    PrevFrame,
+    NextFrame,
+    InsertKeyframe,
+    ExportGif,
+    ExportSpritesheet,
+    /// Импорт выбранного в окне "Adobe Animate" символа/кадра как нового
+    /// персонажа сцены.
+    ImportXfl,
+}
+
+/// Папка для SVG-частей, импортированных из Adobe Animate:
+/// `imported/<документ>/<символ>_f<кадр>/`. В `.gitignore` — исходники
+/// (особенно чужие, как MLP-паппеты) в репозиторий попадать не должны.
+fn xfl_import_dir(doc_name: &str, symbol: Option<&str>, frame: usize) -> std::path::PathBuf {
+    let clean = |s: &str| -> String { s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect() };
+    std::path::Path::new("imported").join(clean(doc_name)).join(format!("{}_f{frame}", clean(symbol.unwrap_or("main"))))
+}
+
+/// Символ, который разумно показать сразу после открытия .fla: у паппетов
+/// MLP это контейнер персонажа (`~RD_Character`), иначе главная шкала.
+fn default_xfl_symbol(doc: &pony_core::xfl::XflDocument) -> Option<String> {
+    let names = doc.symbol_names();
+    names
+        .iter()
+        .find(|n| n.starts_with('~') && n.to_lowercase().contains("character"))
+        .or_else(|| names.iter().find(|n| n.starts_with('~')))
+        .map(|n| n.to_string())
+}
+
+/// Как подогнать вид Stage (см. View > Fit ...).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FitView {
+    /// Персонаж целиком, крупно — так открывается окно.
+    Character,
+    /// Вся экспортная область документа (SCENE_WIDTH x SCENE_HEIGHT).
+    Document,
+}
+
+/// Ассеты подключены относительными путями (`assets/pony/...`). Если
+/// бинарник запущен не из корня workspace (из IDE, из `crates/pony-gui`,
+/// двойным кликом по exe) — персонаж рисовался цветными заглушками без
+/// единой ошибки. Ищем папку `assets` рядом: сначала текущая папка, потом
+/// корень workspace, известный на этапе сборки, потом предки exe.
+fn find_workspace_root() -> Option<std::path::PathBuf> {
+    let has_assets = |dir: &std::path::Path| dir.join("assets").join("pony").is_dir();
+    let cwd = std::env::current_dir().ok();
+    if cwd.as_deref().is_some_and(has_assets) {
+        return None; // уже на месте
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."));
+    if let Ok(exe) = std::env::current_exe() {
+        candidates.extend(exe.ancestors().skip(1).map(|p| p.to_path_buf()));
+    }
+    if let Some(cwd) = cwd {
+        candidates.extend(cwd.ancestors().skip(1).map(|p| p.to_path_buf()));
+    }
+    candidates.into_iter().find(|dir| has_assets(dir))
+}
+
+/// Часть персонажа под точкой (мировые координаты) — верхняя по порядку
+/// отрисовки. Скрытые и заблокированные слои пропускаются. Та же
+/// геометрия, что у рендера (`part_world_position`/`part_render_size` +
+/// 2.5D-поворот), без учёта поворота самой кости (габарит — AABB).
+fn part_at(character: &Character, hidden: &HashSet<String>, locked: &HashSet<String>, world: glam::Vec2) -> Option<String> {
+    let mut best: Option<(String, i32)> = None;
+    for (id, part) in &character.parts {
+        if locked.contains(id) || hidden.contains(id) || character.is_part_hidden_by_group(id) {
+            continue;
+        }
+        let Some((center, half)) = part_screen_box(character, part) else { continue };
+        if (center.x - world.x).abs() <= half.x.max(2.0) && (center.y - world.y).abs() <= half.y.max(2.0) {
+            // Тот же порядок, что у рендера: (layer, id) — сверху то,
+            // что нарисовано последним.
+            let better = best.as_ref().map(|(bid, l)| (part.layer, id) > (*l, bid)).unwrap_or(true);
+            if better {
+                best = Some((id.clone(), part.layer));
+            }
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Центр и половины габарита части в мировых координатах — как её видно
+/// на Stage (с 2.5D-поворотом персонажа).
+fn part_screen_box(character: &Character, part: &Part) -> Option<(glam::Vec2, glam::Vec2)> {
+    let world = character.skeleton.world_transform_with_ik(part.bone.as_ref()?)?;
+    let part_pos = pony_render::part_world_position(part, &world);
+    let depth_z = pony_render::part_depth(character, part);
+    let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
+    let size = pony_render::part_render_size(part);
+    let morph = pony_render::part_morph_scale(character, part);
+    let half = glam::Vec2::new(size.x * world.scale.x.abs() * foreshorten * morph.x / 2.0, size.y * world.scale.y.abs() * morph.y / 2.0);
+    Some((glam::Vec2::new(yawed_x, part_pos.y), half))
+}
+
+/// Габарит всех видимых частей персонажа в мировых координатах — для
+/// View > Fit Character.
+fn character_bounds(character: &Character, hidden: &HashSet<String>) -> Option<(glam::Vec2, glam::Vec2)> {
+    let mut acc: Option<(glam::Vec2, glam::Vec2)> = None;
+    for (id, part) in &character.parts {
+        if hidden.contains(id) {
+            continue;
+        }
+        let Some((center, half)) = part_screen_box(character, part) else { continue };
+        let (lo, hi) = (center - half, center + half);
+        acc = Some(match acc {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+    }
+    acc
+}
+
+/// То, из чего собран последний отрендеренный кадр Stage — если ничего из
+/// этого не изменилось, кадр не перерисовывается (GPU-рендер + чтение
+/// пикселей обратно на CPU на КАЖДЫЙ кадр раньше грузили процессор на
+/// 100%, даже когда в окне ничего не происходило).
+#[derive(PartialEq)]
+struct RenderKey {
+    character: Character,
+    hidden: HashSet<String>,
+    camera: pony_core::Camera,
+    lighting: pony_core::Lighting,
+    size: (u32, u32),
+}
+
+/// Первое свободное имя вида `base`, `base_2`, `base_3`... Счётчики вида
+/// "drawn_{N}" начинались с 1 при каждом запуске, и после открытия
+/// сохранённого персонажа новая фигура получала id уже существующей части
+/// (та молча заменялась, а её .svg перезаписывался), второй "Duplicate
+/// layer" затирал первую копию, новая кость получала id существующей.
+fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base}_{n}")).find(|c| !taken(c)).expect("бесконечный ряд кандидатов")
+}
+
+/// Длительность моргания от `pony.Blink()`.
+const BLINK_SECONDS: f32 = 0.25;
+
+/// Скрипт выставил морф Blink — превращаем его в короткое моргание (см.
+/// `blink_timer` в main), а не в навсегда закрытые глаза.
+fn take_blink(character: &mut Character, blink_timer: &mut f32) {
+    if character.default_morph.get("Blink") > 0.0 {
+        character.default_morph.set("Blink", 0.0);
+        *blink_timer = BLINK_SECONDS;
+    }
 }
 
 fn selected_bone_id(character: &pony_core::Character, selected: &Option<String>) -> Option<String> {
@@ -611,12 +994,25 @@ fn insert_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, ch
 fn remove_keyframe(anim: &mut pony_core::animation::Animation, bone_id: &str, channel: BoneChannel, time: f32) -> Option<f32> {
     let target_matches = |t: &AnimTarget| matches!(t, AnimTarget::Bone { id, channel: c } if id == bone_id && *c == channel);
     let track = anim.tracks.iter_mut().find(|t| target_matches(&t.target))?;
-    let idx = track.keyframes.iter().position(|k| (k.time - time).abs() < 1e-3)?;
+    // Совпадение с точностью до полукадра: ключ, поставленный не ровно на
+    // границу кадра (например, через Insert > Keyframe в произвольный
+    // момент), всё равно рисуется в ячейке своего кадра — и удаляться/
+    // перетаскиваться должен по клику на эту ячейку.
+    let idx = track.keyframes.iter().position(|k| (k.time - time).abs() < 0.5 / FPS)?;
     let kf = track.keyframes.remove(idx);
     match kf.value {
         AnimValue::Float(v) => Some(v),
         _ => Some(0.0),
     }
+}
+
+/// Есть ли уже ключ на этом кадре (с точностью до полукадра) у дорожки
+/// канала кости — чтобы перетаскиваемый ключ не затёр чужой.
+fn has_keyframe_at(anim: &pony_core::animation::Animation, bone_id: &str, channel: BoneChannel, time: f32) -> bool {
+    anim.tracks
+        .iter()
+        .filter(|t| matches!(&t.target, AnimTarget::Bone { id, channel: c } if id == bone_id && *c == channel))
+        .any(|t| t.keyframes.iter().any(|k| (k.time - time).abs() < 0.5 / FPS))
 }
 
 /// Текущее значение выбранного канала кости — им затравливается новый
@@ -659,7 +1055,7 @@ fn character_timeline_strip(ui: &mut egui::Ui, character: &Character, player: &A
     };
     painter.rect_filled(rect, 3.0, bg);
     if is_active {
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 140, 200)));
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 140, 200)));
     }
 
     let anim = player.current_name().and_then(|n| character.animations.get(n));
@@ -675,12 +1071,12 @@ fn character_timeline_strip(ui: &mut egui::Ui, character: &Character, player: &A
     // подобран под конкретную длину; здесь считаем от реальной
     // длительности, чтобы деления оставались осмысленными на любой
     // анимации, а не только на демонстрационной из ТЗ).
-    painter.line_segment([egui::pos2(line_left, line_y), egui::pos2(line_right, line_y)], egui::Stroke::new(1.5, egui::Color32::from_gray(130)));
+    painter.line_segment([egui::pos2(line_left, line_y), egui::pos2(line_right, line_y)], egui::Stroke::new(1.5_f32, egui::Color32::from_gray(130)));
     let tick_every = (total_frames / 4).max(1);
     let mut f = 0;
     while f <= total_frames {
         let x = line_left + (f as f32 / total_frames as f32) * span;
-        painter.line_segment([egui::pos2(x, line_y - 3.0), egui::pos2(x, line_y + 3.0)], egui::Stroke::new(1.0, egui::Color32::from_gray(95)));
+        painter.line_segment([egui::pos2(x, line_y - 3.0), egui::pos2(x, line_y + 3.0)], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(95)));
         f += tick_every;
     }
 
@@ -690,7 +1086,7 @@ fn character_timeline_strip(ui: &mut egui::Ui, character: &Character, player: &A
                 let frac = (kf.time / duration).clamp(0.0, 1.0);
                 let x = line_left + frac * span;
                 painter.circle_filled(egui::pos2(x, line_y), 3.0, egui::Color32::from_rgb(230, 190, 90));
-                painter.circle_stroke(egui::pos2(x, line_y), 3.0, egui::Stroke::new(0.8, egui::Color32::from_rgb(120, 90, 30)));
+                painter.circle_stroke(egui::pos2(x, line_y), 3.0, egui::Stroke::new(0.8_f32, egui::Color32::from_rgb(120, 90, 30)));
             }
         }
     }
@@ -699,7 +1095,7 @@ fn character_timeline_strip(ui: &mut egui::Ui, character: &Character, player: &A
     // своё, независимое — см. own AnimationPlayer в CharacterSlot).
     let play_frac = (player.time() / duration).clamp(0.0, 1.0);
     let px = line_left + play_frac * span;
-    painter.line_segment([egui::pos2(px, rect.top() + 3.0), egui::pos2(px, line_y + 5.0)], egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 90, 90)));
+    painter.line_segment([egui::pos2(px, rect.top() + 3.0), egui::pos2(px, line_y + 5.0)], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(230, 90, 90)));
 
     response
 }
@@ -896,7 +1292,7 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             }
             painter.add(egui::Shape::closed_line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
         }
-        VectorShape::Path { nodes, closed, fill, stroke, stroke_width, fill_gradient } => {
+        VectorShape::Path { nodes, closed, fill, stroke, stroke_width, fill_gradient, extra_contours } => {
             // Превью тесселирует каждый сегмент (прямой или кубическую
             // Безье) в ломаную из фиксированного числа отрезков — только
             // для оверлея на Stage. Сам сохранённый .svg хранит настоящие
@@ -916,27 +1312,50 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             // вершина тесселяции несёт СВОЙ document-space цвет — и прямой,
             // и кривой сегмент дают достаточно плотную выборку вдоль
             // контура, чтобы градиент выглядел гладким, не гранёным.
+            //
+            // Дополнительные контуры (`extra_contours`, `M…Z M…Z` в одном
+            // `d`): отдельный кусок заливается, а дырка (контур внутри
+            // основного) в превью только обводится — egui-меш не умеет
+            // вычитать. В сохранённом .svg (resvg) дырка настоящая.
             const SEGMENTS: usize = 16;
-            let mut screen_pts: Vec<egui::Pos2> = Vec::new();
-            let mut doc_pts: Vec<(f32, f32)> = Vec::new();
-            if !nodes.is_empty() {
-                screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
-                doc_pts.push(nodes[0].position);
-                for i in 1..nodes.len() {
-                    tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+            let tessellate = |nodes: &[pony_core::PathNode], closed: bool| -> (Vec<egui::Pos2>, Vec<(f32, f32)>) {
+                let mut screen_pts: Vec<egui::Pos2> = Vec::new();
+                let mut doc_pts: Vec<(f32, f32)> = Vec::new();
+                if !nodes.is_empty() {
+                    screen_pts.push(world_to_screen(glam::Vec2::new(nodes[0].position.0, -nodes[0].position.1)));
+                    doc_pts.push(nodes[0].position);
+                    for i in 1..nodes.len() {
+                        tessellate_segment(&nodes[i - 1], &nodes[i], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                    }
+                    if closed && nodes.len() > 1 {
+                        tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                    }
                 }
-                if *closed && nodes.len() > 1 {
-                    tessellate_segment(&nodes[nodes.len() - 1], &nodes[0], SEGMENTS, world_to_screen, &mut screen_pts, &mut doc_pts);
+                (screen_pts, doc_pts)
+            };
+            let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
+            let fill_contour = |screen_pts: &[egui::Pos2], doc_pts: &[(f32, f32)]| {
+                if fill.a > 0 && screen_pts.len() >= 3 {
+                    let colors: Vec<egui::Color32> = doc_pts.iter().map(|(x, y)| color_at(*x, *y)).collect();
+                    if let Some(mesh) = triangulate_fill(screen_pts, &colors) {
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
                 }
+            };
+            let (main_screen, main_doc) = tessellate(nodes, *closed);
+            if *closed {
+                fill_contour(&main_screen, &main_doc);
             }
-            if *closed && fill.a > 0 && screen_pts.len() >= 3 {
-                let color_at = shape_fill_color_fn(*fill, fill_gradient.as_deref(), vector_doc);
-                let colors: Vec<egui::Color32> = doc_pts.iter().map(|(x, y)| color_at(*x, *y)).collect();
-                if let Some(mesh) = triangulate_fill(&screen_pts, &colors) {
-                    painter.add(egui::Shape::mesh(mesh));
+            let stroke_style = egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke));
+            for contour in extra_contours {
+                let (screen_pts, doc_pts) = tessellate(&contour.nodes, contour.closed);
+                let is_hole = *closed && doc_pts.first().is_some_and(|p| point_in_polygon(*p, &main_doc));
+                if contour.closed && !is_hole {
+                    fill_contour(&screen_pts, &doc_pts);
                 }
+                painter.add(egui::Shape::line(screen_pts, stroke_style));
             }
-            painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(*stroke_width, rgba_to_color32(*stroke))));
+            painter.add(egui::Shape::line(main_screen, stroke_style));
         }
         VectorShape::Instance { .. } => {
             // Никогда не должен дойти сюда: вызывающая сторона (см. цикл
@@ -947,6 +1366,18 @@ fn draw_vector_shape_preview(painter: &egui::Painter, shape: &pony_core::VectorS
             debug_assert!(false, "draw_vector_shape_preview получил Instance напрямую — вызывающая сторона должна была резолвить его через resolve_symbol_instance");
         }
     }
+}
+
+/// Точка внутри многоугольника (чётность пересечений луча).
+fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < (b.0 - a.0) * (p.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// Разбить один сегмент path (`from` -> `to`, кривая если у концов есть
@@ -1177,6 +1608,12 @@ fn export_animation_spritesheet(
 }
 
 fn main() {
+    if let Some(root) = find_workspace_root() {
+        if std::env::set_current_dir(&root).is_ok() {
+            eprintln!("pony-gui: рабочая папка -> {} (там лежат assets/)", root.display());
+        }
+    }
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = WindowBuilder::new()
         .with_title("pony-engine")
@@ -1236,7 +1673,10 @@ fn main() {
     // Windows это роняло приложение при старте с STATUS_ACCESS_VIOLATION
     // (0xC0000005). Бюджет считается только из доступной памяти, GPU для
     // него не нужны — см. WorkloadPolicy::from_profile.
-    let texture_budget = pony_system::WorkloadPolicy::from_profile(&pony_system::SystemProfile::detect_without_gpus()).memory_budget_bytes;
+    // Бюджет считается от ОПЕРАТИВНОЙ памяти, а текстуры живут в видеопамяти:
+    // 75% от 32 ГБ ОЗУ при 4 ГБ на видеокарте — кэш никогда бы не вытеснялся.
+    // Потолок 1 ГиБ — с запасом для десятков импортированных паппетов.
+    let texture_budget = pony_system::WorkloadPolicy::from_profile(&pony_system::SystemProfile::detect_without_gpus()).memory_budget_bytes.min(1 << 30);
     let mut pony_renderer = Renderer::new_with_budget(&gpu_ctx, texture_budget);
 
     let egui_ctx = egui::Context::default();
@@ -1246,6 +1686,7 @@ fn main() {
     let mut character = build_walking_pony();
     let mut player = AnimationPlayer::new();
     player.play("Walk");
+    player.apply(&mut character);
 
     // --- сцена из нескольких персонажей ---
     // Намеренно НЕ переписываю все существующие обращения к `character`/
@@ -1274,7 +1715,10 @@ fn main() {
     let script_engine = pony_script::ScriptEngine::new();
     let mut script_text = String::from("// Пример — жми \"Выполнить\"\npony.Smile(0.8);\npony.Blink();\ncamera.Zoom(1.2);");
     let mut script_log = String::new();
-    let mut playing = true;
+    // На паузе при старте, как в любом редакторе анимации: пока анимация
+    // играет, плеер каждый кадр переписывает анимируемые каналы костей, и
+    // правка, скажем, позиции головы тут же "отскакивала" обратно.
+    let mut playing = false;
     let mut scene_texture: Option<egui::TextureHandle> = None;
     let mut last_frame = Instant::now();
     let mut elapsed_time: f32 = 0.0;
@@ -1311,11 +1755,12 @@ fn main() {
     let mut particle_kind = pony_core::ParticleKind::Snow;
     let mut particle_emitter = pony_core::ParticleEmitter::new(particle_kind, glam::Vec2::new(0.0, 90.0), 8.0);
 
-    // --- 2.5D-поворот (раздел 8 ТЗ) в градусах для UI, character.facing_yaw в радианах ---
-    let mut facing_yaw_deg: f32 = 0.0;
 
     // --- рисование/редактирование SVG прямо на Stage (раздел 16 ТЗ) ---
     let mut vector_doc = pony_core::VectorDoc::new();
+    let mut history = History::new(&character, &vector_doc);
+    let mut saved_revision: u64 = 0;
+    let mut window_title = String::new();
     // Начало текущего перетаскивания (мировые координаты) для Rect/Oval/Line —
     // фигура коммитится в vector_doc только когда drag реально закончился.
     let mut draw_start: Option<glam::Vec2> = None;
@@ -1326,9 +1771,28 @@ fn main() {
     // Импорт ассетов из GUI (см. меню File > Import asset as layer).
     let mut import_path = String::from("assets/pony/body.png");
     let mut import_count: u32 = 0;
-    // История отмены (меню Edit). Снимки полного Character — см. push_undo.
-    let mut undo_stack: Vec<pony_core::Character> = Vec::new();
-    let mut redo_stack: Vec<pony_core::Character> = Vec::new();
+    // Путь .asset для File > Open/Save (редактируемый в меню File).
+    let mut asset_path = String::from(ASSET_PATH);
+    // Очередь действий из меню/тулбара/горячих клавиш — см. `Action`.
+    let mut actions: Vec<Action> = Vec::new();
+    // Запрос подогнать вид Stage — выполняется в CentralPanel, где
+    // известен размер холста. При старте — крупно на персонажа (раньше
+    // он занимал ~30px посреди огромного голубого поля).
+    let mut fit_request: Option<FitView> = Some(FitView::Character);
+    // --- импорт Adobe Animate (.fla/.xfl): окно с выбором символа и кадра ---
+    let mut xfl_window_open = false;
+    let mut xfl_path = String::new();
+    let mut xfl_doc: Option<pony_core::xfl::XflDocument> = None;
+    let mut xfl_symbol: Option<String> = None; // None — главная шкала документа
+    let mut xfl_frame: usize = 0;
+    let mut xfl_filter = String::new();
+    let mut xfl_opts = pony_core::xfl::ImportOptions { scale: 1.0, expand_containers: true };
+    let mut xfl_preview: Option<egui::TextureHandle> = None;
+    let mut xfl_preview_key: Option<(Option<String>, usize)> = None;
+    let mut xfl_info = String::new();
+    // Загрузка документа отложена на конец кадра (может занять секунду на
+    // больших .fla) — запрос ставят кнопка "Загрузить" и File > Open.
+    let mut xfl_load_request = false;
     let mut blank_layer_count: u32 = 0;
     let mut show_rulers = true;
 
@@ -1414,24 +1878,28 @@ fn main() {
     let mut selected_keyframe: Option<(String, i64)> = None;
     let mut timeline_channel: BoneChannel = BoneChannel::PositionY;
 
-    // --- производительность: не гонять дорогой GPU-рендер персонажа
-    // (render+readback на CPU+перезалив текстуры) на каждый кадр во время
-    // перетаскивания фигуры рисования (Rect/Oval/Line/Pencil/Brush) — в
-    // этот момент персонаж вообще не меняется (см. код Stage ниже: эти
-    // инструменты пишут только в vector_doc/pencil_points), а мышь на
-    // Xvfb/софтверном рендере шлёт события на каждый пиксель движения,
-    // и полный ре-рендер персонажа на каждое из них — вот источник лага
-    // при рисовании. Осознанно НЕ делаем общий dirty-флаг на все места
-    // мутации персонажа (Transform-слайдеры, drag кости, скрипт и т.д.) —
-    // легко забыть один случай и получить куда худший баг, "картинка не
-    // обновилась". Здесь риска нет: вне рисования рендерим, как и раньше,
-    // каждый кадр, без исключений.
-    // Значение — про ПРОШЛЫЙ кадр (обновляется в конце текущего, читается
-    // в начале следующего): при click-то-draw без задержки на первый кадр
-    // после начала drag'а мы ещё отрендерим персонажа (не страшно — редко),
-    // а все последующие кадры одного drag'а — уже пропустят рендер.
-    let mut was_dragging_shape_last_frame = false;
+    // --- рендер Stage: кадр рендерится в разрешении ЭКРАНА, а не
+    // фиксированного документа — поэтому персонаж остаётся чётким на
+    // любом зуме Stage (раньше 960x720-картинка растягивалась, и при
+    // увеличении всё размывалось). Перерисовывается только когда
+    // что-то изменилось (см. `RenderKey`).
+    let mut last_render_key: Option<RenderKey> = None;
     let mut last_frame_output: Option<pony_render::FrameOutput> = None;
+    // Экранный прямоугольник (в точках egui), который покрывает
+    // `scene_texture`, и масштаб точки->пиксель — для пипетки.
+    let mut scene_image_rect = egui::Rect::NOTHING;
+    let mut force_render = false;
+    // Предыдущий кадр: был ли повод перерисоваться ещё раз (анимация,
+    // частицы, тряска, изменение документа) — иначе цикл спит (Wait).
+    let mut needs_redraw = true;
+    // Моргание — короткое действие, а не состояние: `pony.Blink()` ставит
+    // таймер, глаз закрывается и открывается за BLINK_SECONDS. В самого
+    // персонажа это не пишется (иначе каждый кадр моргания был бы шагом
+    // Undo, а глаза после скрипта оставались закрытыми навсегда).
+    let mut blink_timer: f32 = 0.0;
+    // Selection: смещение от точки захвата до центра части — чтобы часть
+    // ехала за мышью с того места, за которое её взяли, а не прыгала центром.
+    let mut grab_offset: Option<glam::Vec2> = None;
 
     let autoexit_at = std::env::var("PONY_GUI_AUTOEXIT_MS")
         .ok()
@@ -1450,8 +1918,12 @@ fn main() {
             match event {
                 Event::WindowEvent { window_id, event } if window_id == window.id() => {
                     let response = egui_state.on_window_event(&window, &event);
-                    if response.consumed {
+                    // RedrawRequested egui-winit тоже помечает repaint=true — на него
+                    // не отвечаем новым запросом, иначе цикл никогда не уснёт.
+                    if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
                         window.request_redraw();
+                    }
+                    if response.consumed {
                         return;
                     }
                     match event {
@@ -1460,19 +1932,38 @@ fn main() {
                             surface_config.width = new_size.width.max(1);
                             surface_config.height = new_size.height.max(1);
                             surface.configure(&gpu_ctx.device, &surface_config);
+                            window.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
-                            let dt = last_frame.elapsed().as_secs_f32();
+                            // dt зажат: цикл теперь спит, пока ничего не
+                            // происходит, и первый кадр после простоя иначе
+                            // получил бы dt в несколько секунд — анимация
+                            // прыгала бы вперёд при нажатии Play.
+                            let dt = last_frame.elapsed().as_secs_f32().min(0.1);
                             last_frame = Instant::now();
                             elapsed_time += dt;
                             if playing {
                                 player.advance(&character, dt);
                                 player.apply(&mut character);
+                                // Незацикленная анимация доиграла — останавливаемся
+                                // сами, а не крутим пустые кадры.
+                                if player.is_finished(&character) {
+                                    playing = false;
+                                }
                             }
                             // Тряска затухает со временем — сама Camera не хранит
                             // часы и не решает это за нас (см. camera.rs), поэтому
                             // затухание — здесь, в игровом цикле GUI.
                             camera.shake_intensity = (camera.shake_intensity - dt * 0.6).max(0.0);
+                            if blink_timer > 0.0 {
+                                blink_timer = (blink_timer - dt).max(0.0);
+                                // Последний кадр моргания: персонаж не менялся, и без
+                                // принудительной перерисовки на экране оставался
+                                // полузакрытый глаз.
+                                if blink_timer == 0.0 {
+                                    force_render = true;
+                                }
+                            }
 
                             // Освещение реально пересчитывается из состояния UI-переключателей
                             // каждый кадр — не заглушка Lighting::default().
@@ -1496,81 +1987,148 @@ fn main() {
                                 particle_emitter.update(dt);
                             }
 
-                            character.facing_yaw = facing_yaw_deg.to_radians();
-
-                            // Пропускаем дорогой рендер персонажа именно во время
-                            // перетаскивания фигуры рисования (см. пояснение у объявления
-                            // `was_dragging_shape_last_frame` выше) — во всех остальных
-                            // случаях рендерим каждый кадр, как и раньше, без исключений.
-                            if !was_dragging_shape_last_frame {
-                                let mut visible_character = character.clone();
-                                // Часть скрыта, если скрыта ОНА САМА (hidden_layers,
-                                // раньше единственный механизм) ИЛИ группа, в которую
-                                // она входит — включая скрытие любого родителя этой
-                                // группы по цепочке (раздел 27 ТЗ: скрытие группы
-                                // должно скрывать всё вложенное дерево целиком, см.
-                                // `Character::is_part_hidden_by_group`).
-                                visible_character.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
-                                let particles_arg = if particles_enabled { Some(&particle_emitter) } else { None };
-                                let rendered = pony_renderer.render_character(
-                                    &gpu_ctx,
-                                    &visible_character,
-                                    SCENE_WIDTH,
-                                    SCENE_HEIGHT,
-                                    &camera,
-                                    elapsed_time,
-                                    &lighting,
-                                    particles_arg,
-                                );
-                                let color_image =
-                                    egui::ColorImage::from_rgba_unmultiplied([rendered.width as usize, rendered.height as usize], &rendered.rgba);
-                                match &mut scene_texture {
-                                    // LINEAR, не NEAREST — раньше при увеличении Stage
-                                    // сцена растягивалась блоками (каждый исходный
-                                    // пиксель — жёсткий квадрат), и это было заметнее
-                                    // самого MSAA-сглаживания внутри рендера. LINEAR
-                                    // интерполирует между соседними пикселями текстуры
-                                    // при увеличении — сцена остаётся гладкой на любом
-                                    // зуме Stage, не только "нативном" 1:1.
-                                    Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
-                                    None => scene_texture = Some(egui_ctx.load_texture("pony-scene", color_image, egui::TextureOptions::LINEAR)),
-                                }
-                                last_frame_output = Some(rendered);
-                            }
-
                             let raw_input = egui_state.take_egui_input(&window);
                             let full_output = egui_ctx.run(raw_input, |ctx| {
+                                // --- горячие клавиши (раньше их не было вовсе, даже
+                                // Ctrl+Z/Ctrl+S). Пока фокус в текстовом поле
+                                // (скрипт, имя кости, путь) — не перехватываем,
+                                // чтобы Space/буквы/Backspace печатались. ---
+                                if !ctx.wants_keyboard_input() {
+                                    use egui::{Key, KeyboardShortcut, Modifiers};
+                                    let shortcuts = [
+                                        (KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z), Action::Redo),
+                                        (KeyboardShortcut::new(Modifiers::COMMAND, Key::Z), Action::Undo),
+                                        (KeyboardShortcut::new(Modifiers::COMMAND, Key::Y), Action::Redo),
+                                        (KeyboardShortcut::new(Modifiers::COMMAND, Key::S), Action::Save),
+                                        (KeyboardShortcut::new(Modifiers::COMMAND, Key::O), Action::Open),
+                                        (KeyboardShortcut::new(Modifiers::COMMAND, Key::N), Action::New),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::Space), Action::TogglePlay),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::Home), Action::Rewind),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::End), Action::GoToEnd),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::ArrowLeft), Action::PrevFrame),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::Comma), Action::PrevFrame),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::ArrowRight), Action::NextFrame),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::Period), Action::NextFrame),
+                                        (KeyboardShortcut::new(Modifiers::NONE, Key::F6), Action::InsertKeyframe),
+                                    ];
+                                    for (shortcut, action) in shortcuts {
+                                        if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                                            actions.push(action);
+                                        }
+                                    }
+                                    // Масштаб вида: Ctrl+1 — 100%, Ctrl+2 — весь документ,
+                                    // Ctrl+3 — персонаж; Ctrl+= / Ctrl+- — шаг зума.
+                                    if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1))) {
+                                        stage_zoom = 1.0;
+                                    }
+                                    if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2))) {
+                                        fit_request = Some(FitView::Document);
+                                    }
+                                    if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Num3))) {
+                                        fit_request = Some(FitView::Character);
+                                    }
+                                    if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals)) || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus))) {
+                                        stage_zoom = (stage_zoom * 1.25).min(MAX_STAGE_ZOOM);
+                                    }
+                                    if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus))) {
+                                        stage_zoom = (stage_zoom / 1.25).max(MIN_STAGE_ZOOM);
+                                    }
+                                    // Инструменты — буквы как в Adobe Animate.
+                                    let no_mods = ctx.input(|i| i.modifiers.is_none());
+                                    if no_mods {
+                                        for (key, tool) in [
+                                            (Key::V, Tool::Selection),
+                                            (Key::A, Tool::SubSelection),
+                                            (Key::Q, Tool::FreeTransform),
+                                            (Key::L, Tool::Lasso),
+                                            (Key::P, Tool::Pen),
+                                            (Key::Y, Tool::Pencil),
+                                            (Key::B, Tool::Brush),
+                                            (Key::N, Tool::Line),
+                                            (Key::R, Tool::Rectangle),
+                                            (Key::O, Tool::Oval),
+                                            (Key::K, Tool::PaintBucket),
+                                            (Key::S, Tool::InkBottle),
+                                            (Key::I, Tool::Eyedropper),
+                                            (Key::H, Tool::Hand),
+                                            (Key::Z, Tool::Zoom),
+                                        ] {
+                                            if ctx.input(|i| i.key_pressed(key)) {
+                                                active_tool = tool;
+                                            }
+                                        }
+                                        // Escape — отменить незаконченное: путь Pen,
+                                        // установку кости, групповое выделение.
+                                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                                            if !pen_points.is_empty() {
+                                                pen_points.clear();
+                                                status_message = "Путь Pen отменён".into();
+                                            } else if placing_bone {
+                                                placing_bone = false;
+                                            } else if active_tool == Tool::FreeTransform && selected_bone.is_some() {
+                                                // Выйти из выбранной кости (например, контейнера
+                                                // головы) — следующий клик возьмёт кость части.
+                                                selected_bone = None;
+                                                status_message = "Xform: выбор кости снят".into();
+                                            } else if !multi_selected.is_empty() {
+                                                multi_selected.clear();
+                                            } else {
+                                                selected_layer = None;
+                                                selected_shape_index = None;
+                                                selected_keyframe = None;
+                                            }
+                                        }
+                                        // Enter — закончить открытый путь Pen ломаной
+                                        // (замкнуть — клик по первой точке).
+                                        if ctx.input(|i| i.key_pressed(Key::Enter)) && pen_points.len() >= 2 {
+                                            vector_doc.add(pony_core::VectorShape::Polyline {
+                                                points: std::mem::take(&mut pen_points),
+                                                stroke: color32_to_rgba(stroke_color),
+                                                stroke_width: 1.5,
+                                            });
+                                            status_message = "Открытый путь Pen добавлен".into();
+                                        }
+                                        // Delete в SubSelection — удалить выбранную фигуру холста
+                                        // (ключи таймлайна удаляются там же, в timeline_widget).
+                                        if active_tool == Tool::SubSelection && ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                                            if let Some(idx) = selected_shape_index.take() {
+                                                if idx < vector_doc.shapes.len() {
+                                                    vector_doc.shapes.remove(idx);
+                                                    status_message = "Фигура удалена".into();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                                     egui::menu::bar(ui, |ui| {
                                         ui.menu_button("File", |ui| {
-                                            if ui.button("New").clicked() {
-                                                character = build_walking_pony();
-                                                player = AnimationPlayer::new();
-                                                player.play("Walk");
-                                                selected_layer = None;
-                                                status_message = "Новый персонаж".into();
+                                            ui.set_min_width(300.0);
+                                            if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() {
+                                                actions.push(Action::New);
                                                 ui.close_menu();
                                             }
-                                            if ui.button(format!("Save ({ASSET_PATH})")).clicked() {
-                                                status_message = match character.save_to_file(ASSET_PATH) {
-                                                    Ok(()) => format!("Сохранено в {ASSET_PATH}"),
-                                                    Err(err) => format!("Ошибка сохранения: {err}"),
-                                                };
+                                            if ui.add(egui::Button::new("Open").shortcut_text("Ctrl+O")).clicked() {
+                                                actions.push(Action::Open);
                                                 ui.close_menu();
                                             }
-                                            if ui.button(format!("Open ({ASSET_PATH})")).clicked() {
-                                                match Character::load_from_file(ASSET_PATH) {
-                                                    Ok(loaded) => {
-                                                        character = loaded;
-                                                        player = AnimationPlayer::new();
-                                                        selected_layer = None;
-                                                        status_message = format!("Загружено из {ASSET_PATH}");
-                                                    }
-                                                    Err(err) => status_message = format!("Ошибка загрузки: {err}"),
-                                                }
+                                            if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
+                                                actions.push(Action::Save);
                                                 ui.close_menu();
                                             }
+                                            // Диалога выбора файла нет — путь .asset задаётся
+                                            // здесь (раньше был зашит намертво в gui_character.asset).
+                                            ui.horizontal(|ui| {
+                                                ui.label("Файл:");
+                                                ui.add(egui::TextEdit::singleline(&mut asset_path).desired_width(200.0));
+                                            });
+                                            ui.weak(".asset — персонаж; .fla/.xfl — откроется окно импорта Adobe Animate");
                                             ui.separator();
+                                            if ui.button("Import Adobe Animate (.fla/.xfl)…").clicked() {
+                                                xfl_window_open = true;
+                                                ui.close_menu();
+                                            }
                                             ui.separator();
                                             // Импорт ассетов: движок умеет PNG/SVG/PSD/KRA, но
                                             // до этого добраться до них из GUI было нельзя
@@ -1609,7 +2167,7 @@ fn main() {
                                                             status_message = format!("Файл не найден: {import_path}");
                                                         } else {
                                                             import_count += 1;
-                                                            let part_id = format!("imported_{import_count}");
+                                                            let part_id = unique_name(&format!("imported_{import_count}"), |c| character.parts.contains_key(c));
                                                             character.add_part(
                                                                 pony_core::part::Part::new(&part_id, pony_core::part::PartKind::Custom, source)
                                                                     .with_bone("Body")
@@ -1623,19 +2181,11 @@ fn main() {
                                             });
                                             ui.separator();
                                             if ui.button("Export GIF (текущая анимация)").clicked() {
-                                                status_message =
-                                                    export_animation_gif(&mut pony_renderer, &gpu_ctx, &character, player.current_name(), &camera, &lighting);
+                                                actions.push(Action::ExportGif);
                                                 ui.close_menu();
                                             }
                                             if ui.button("Export Spritesheet (текущая анимация)").clicked() {
-                                                status_message = export_animation_spritesheet(
-                                                    &mut pony_renderer,
-                                                    &gpu_ctx,
-                                                    &character,
-                                                    player.current_name(),
-                                                    &camera,
-                                                    &lighting,
-                                                );
+                                                actions.push(Action::ExportSpritesheet);
                                                 ui.close_menu();
                                             }
                                             ui.separator();
@@ -1644,31 +2194,20 @@ fn main() {
                                             }
                                         });
                                         ui.menu_button("Edit", |ui| {
-                                            let can_undo = !undo_stack.is_empty();
-                                            let can_redo = !redo_stack.is_empty();
-                                            if ui.add_enabled(can_undo, egui::Button::new(format!("Undo ({})", undo_stack.len()))).clicked() {
-                                                if let Some(prev) = undo_stack.pop() {
-                                                    redo_stack.push(character.clone());
-                                                    character = prev;
-                                                    selected_layer = None;
-                                                    status_message = "Отменено".into();
-                                                }
+                                            let can_undo = !history.undo.is_empty();
+                                            let can_redo = !history.redo.is_empty();
+                                            if ui.add_enabled(can_undo, egui::Button::new(format!("Undo ({})", history.undo.len())).shortcut_text("Ctrl+Z")).clicked() {
+                                                actions.push(Action::Undo);
                                                 ui.close_menu();
                                             }
-                                            if ui.add_enabled(can_redo, egui::Button::new(format!("Redo ({})", redo_stack.len()))).clicked() {
-                                                if let Some(next) = redo_stack.pop() {
-                                                    undo_stack.push(character.clone());
-                                                    character = next;
-                                                    selected_layer = None;
-                                                    status_message = "Возвращено".into();
-                                                }
+                                            if ui.add_enabled(can_redo, egui::Button::new(format!("Redo ({})", history.redo.len())).shortcut_text("Ctrl+Shift+Z")).clicked() {
+                                                actions.push(Action::Redo);
                                                 ui.close_menu();
                                             }
                                             ui.separator();
                                             let has_sel = selected_layer.is_some();
                                             if ui.add_enabled(has_sel, egui::Button::new("Delete layer")).clicked() {
                                                 if let Some(id) = selected_layer.clone() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     character.parts.remove(&id);
                                                     hidden_layers.remove(&id);
                                                     locked_layers.remove(&id);
@@ -1680,8 +2219,7 @@ fn main() {
                                             if ui.add_enabled(has_sel, egui::Button::new("Duplicate layer")).clicked() {
                                                 if let Some(id) = selected_layer.clone() {
                                                     if let Some(src) = character.parts.get(&id).cloned() {
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
-                                                        let new_id = format!("{id}_copy");
+                                                        let new_id = unique_name(&format!("{id}_copy"), |c| character.parts.contains_key(c));
                                                         let mut copy = src.clone();
                                                         copy.id = new_id.clone();
                                                         copy.layer = src.layer + 1;
@@ -1712,7 +2250,6 @@ fn main() {
                                                     ui.close_menu();
                                                 }
                                                 if ui.button("Удалить группу").clicked() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     for id in multi_selected.drain() {
                                                         character.parts.remove(&id);
                                                         hidden_layers.remove(&id);
@@ -1732,7 +2269,6 @@ fn main() {
                                                 // группу (`Character::groups`, переживает сохранение
                                                 // .asset) — та же организационная роль, что `<g>` в SVG.
                                                 if ui.button("Group (создать постоянную группу)").clicked() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     let ids: Vec<String> = multi_selected.iter().cloned().collect();
                                                     let group_id = character.group_parts(format!("Group {}", character.groups.groups.len() + 1), &ids);
                                                     status_message = format!("Группа '{group_id}' создана из {} частей", ids.len());
@@ -1743,22 +2279,24 @@ fn main() {
                                         });
 
                                         ui.menu_button("View", |ui| {
-                                            if ui.button("Zoom In").clicked() {
-                                                stage_zoom = (stage_zoom * 1.25).min(8.0);
+                                            if ui.add(egui::Button::new("Zoom In").shortcut_text("Ctrl+=")).clicked() {
+                                                stage_zoom = (stage_zoom * 1.25).min(MAX_STAGE_ZOOM);
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Zoom Out").clicked() {
-                                                stage_zoom = (stage_zoom / 1.25).max(0.1);
+                                            if ui.add(egui::Button::new("Zoom Out").shortcut_text("Ctrl+-")).clicked() {
+                                                stage_zoom = (stage_zoom / 1.25).max(MIN_STAGE_ZOOM);
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Zoom 100%").clicked() {
+                                            if ui.add(egui::Button::new("Zoom 100%").shortcut_text("Ctrl+1")).clicked() {
                                                 stage_zoom = 1.0;
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Fit / центрировать Stage").clicked() {
-                                                stage_zoom = 1.0;
-                                                stage_pan = egui::Vec2::ZERO;
-                                                status_message = "Вид сброшен".into();
+                                            if ui.add(egui::Button::new("Fit Document").shortcut_text("Ctrl+2")).clicked() {
+                                                fit_request = Some(FitView::Document);
+                                                ui.close_menu();
+                                            }
+                                            if ui.add(egui::Button::new("Fit Character").shortcut_text("Ctrl+3")).clicked() {
+                                                fit_request = Some(FitView::Character);
                                                 ui.close_menu();
                                             }
                                             ui.separator();
@@ -1769,34 +2307,18 @@ fn main() {
                                         });
 
                                         ui.menu_button("Insert", |ui| {
-                                            let anim_name = player.current_name().map(str_to_owned);
-                                            let can_key = anim_name.is_some() && selected_layer.is_some();
                                             if ui
-                                                .add_enabled(can_key, egui::Button::new(format!("Keyframe ({})", channel_label(timeline_channel))))
-                                                .on_disabled_hover_text("Нужны активная анимация и выбранный слой")
+                                                .add_enabled(selected_layer.is_some(), egui::Button::new(format!("Keyframe ({})", channel_label(timeline_channel))).shortcut_text("F6"))
+                                                .on_disabled_hover_text("Сначала выбери слой (на Stage или в Timeline)")
                                                 .clicked()
                                             {
-                                                if let (Some(anim_name), Some(layer_id)) = (anim_name, selected_layer.clone()) {
-                                                    let bone = character.parts.get(&layer_id).and_then(|p| p.bone.clone());
-                                                    if let Some(bone_id) = bone {
-                                                        let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, timeline_channel)).unwrap_or(0.0);
-                                                        let t = player.time();
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
-                                                        if let Some(anim) = character.animations.get_mut(&anim_name) {
-                                                            insert_keyframe(anim, &bone_id, timeline_channel, t, value);
-                                                            status_message = format!("Ключ на t={t:.2}с для кости '{bone_id}' ({})", channel_label(timeline_channel));
-                                                        }
-                                                    } else {
-                                                        status_message = "У выбранного слоя нет кости — ключ ставить не к чему".into();
-                                                    }
-                                                }
+                                                actions.push(Action::InsertKeyframe);
                                                 ui.close_menu();
                                             }
                                             ui.separator();
                                             if ui.button("Пустой слой (заглушка-цвет)").clicked() {
-                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                 blank_layer_count += 1;
-                                                let id = format!("layer_{blank_layer_count}");
+                                                let id = unique_name(&format!("layer_{blank_layer_count}"), |c| character.parts.contains_key(c));
                                                 let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
                                                 character.add_part(
                                                     pony_core::part::Part::new(
@@ -1817,7 +2339,6 @@ fn main() {
                                             let has_sel = selected_layer.is_some();
                                             if ui.add_enabled(has_sel, egui::Button::new("Отразить по горизонтали")).clicked() {
                                                 if let Some(bone_id) = selected_bone_id(&character, &selected_layer) {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     if let Some(b) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
                                                         b.local_transform.scale.x = -b.local_transform.scale.x;
                                                     }
@@ -1826,7 +2347,6 @@ fn main() {
                                             }
                                             if ui.add_enabled(has_sel, egui::Button::new("Отразить по вертикали")).clicked() {
                                                 if let Some(bone_id) = selected_bone_id(&character, &selected_layer) {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     if let Some(b) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
                                                         b.local_transform.scale.y = -b.local_transform.scale.y;
                                                     }
@@ -1835,7 +2355,6 @@ fn main() {
                                             }
                                             if ui.add_enabled(has_sel, egui::Button::new("Сбросить трансформацию")).clicked() {
                                                 if let Some(bone_id) = selected_bone_id(&character, &selected_layer) {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     if let Some(b) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
                                                         b.local_transform = pony_core::skeleton::Transform2D::default();
                                                     }
@@ -1845,7 +2364,6 @@ fn main() {
                                             ui.separator();
                                             if ui.add_enabled(has_sel, egui::Button::new("Поднять слой выше")).clicked() {
                                                 if let Some(id) = selected_layer.clone() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     if let Some(p) = character.parts.get_mut(&id) {
                                                         p.layer += 1;
                                                     }
@@ -1854,7 +2372,6 @@ fn main() {
                                             }
                                             if ui.add_enabled(has_sel, egui::Button::new("Опустить слой ниже")).clicked() {
                                                 if let Some(id) = selected_layer.clone() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     if let Some(p) = character.parts.get_mut(&id) {
                                                         p.layer -= 1;
                                                     }
@@ -1879,8 +2396,8 @@ fn main() {
                                                 match script_engine.run(&script_text) {
                                                     Ok(commands) => {
                                                         let n = commands.len();
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                         pony_script::apply_commands(&mut character, &mut camera, &mut player, &commands);
+                                                        take_blink(&mut character, &mut blink_timer);
                                                         script_log = format!("OK: выполнено {n} команд(ы)");
                                                         status_message = script_log.clone();
                                                     }
@@ -1909,24 +2426,23 @@ fn main() {
                                         });
 
                                         ui.menu_button("Control", |ui| {
-                                            if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
-                                                playing = !playing;
+                                            if ui.add(egui::Button::new(if playing { "Stop" } else { "Play" }).shortcut_text("Space")).clicked() {
+                                                actions.push(Action::TogglePlay);
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Rewind (в начало)").clicked() {
-                                                let cur = player.time();
-                                                player.advance(&character, -cur);
-                                                player.apply(&mut character);
+                                            if ui.add(egui::Button::new("Rewind (в начало)").shortcut_text("Home")).clicked() {
+                                                actions.push(Action::Rewind);
                                                 ui.close_menu();
                                             }
-                                            if ui.button("К концу анимации").clicked() {
-                                                playing = false;
-                                                if let Some(dur) = player.current_name().and_then(|n| character.animations.get(n)).map(|a| a.duration) {
-                                                    let cur = player.time();
-                                                    player.advance(&character, dur - cur);
-                                                    player.apply(&mut character);
-                                                }
+                                            if ui.add(egui::Button::new("К концу анимации").shortcut_text("End")).clicked() {
+                                                actions.push(Action::GoToEnd);
                                                 ui.close_menu();
+                                            }
+                                            if ui.add(egui::Button::new("Кадр назад").shortcut_text("Left")).clicked() {
+                                                actions.push(Action::PrevFrame);
+                                            }
+                                            if ui.add(egui::Button::new("Кадр вперёд").shortcut_text("Right")).clicked() {
+                                                actions.push(Action::NextFrame);
                                             }
                                             ui.separator();
                                             ui.weak("Анимации персонажа:");
@@ -1936,6 +2452,8 @@ fn main() {
                                                 let is_current = player.current_name() == Some(name.as_str());
                                                 if ui.selectable_label(is_current, &name).clicked() {
                                                     player.play(&name);
+                                                    player.apply(&mut character);
+                                                    selected_keyframe = None;
                                                     playing = true;
                                                     status_message = format!("Играет '{name}'");
                                                     ui.close_menu();
@@ -1959,7 +2477,7 @@ fn main() {
                                             ui.label(format!("Живых частиц: {}", particle_emitter.particles.len()));
                                             ui.separator();
                                             ui.label(format!("dt последнего кадра: {:.1} мс", dt * 1000.0));
-                                            ui.label(format!("Undo/Redo: {} / {}", undo_stack.len(), redo_stack.len()));
+                                            ui.label(format!("Undo/Redo: {} / {}", history.undo.len(), history.redo.len()));
                                         });
 
                                         ui.menu_button("Window", |ui| {
@@ -1968,6 +2486,25 @@ fn main() {
                                             ui.checkbox(&mut show_rulers, "Линейки");
                                         });
                                         ui.menu_button("Help", |ui| {
+                                            ui.strong("Горячие клавиши");
+                                            for line in [
+                                                "Ctrl+N / Ctrl+O / Ctrl+S — новый / открыть / сохранить",
+                                                "Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y) — отменить / вернуть",
+                                                "Space — play/pause, стрелки Left/Right — кадр, Home/End — начало/конец",
+                                                "F6 — ключевой кадр для выбранного слоя",
+                                                "Колесо — зум к курсору, средняя кнопка — пан",
+                                                "Ctrl+1 / Ctrl+2 / Ctrl+3 — 100% / документ / персонаж",
+                                                "V A Q L — Sel/SubSel/Xform/Lasso",
+                                                "Xform: тащить — двигать кость, Shift — вращать, Alt+клик — кость-родитель, Esc — снять",
+                                                "File > Import Adobe Animate — открыть .fla/.xfl, выбрать символ и кадр",
+                                                "P Y B N R O — Pen/Pencil/Brush/Line/Rect/Oval",
+                                                "K S I — Fill/Ink/Eyedropper, H Z — Hand/Zoom",
+                                                "Pen: клик — точка, клик по первой — замкнуть, Enter — закончить, Esc — отмена",
+                                                "Delete — удалить выбранный ключ (Timeline) / фигуру (SubSel)",
+                                            ] {
+                                                ui.label(line);
+                                            }
+                                            ui.separator();
                                             ui.weak("pony-engine — см. README.md в репозитории");
                                         });
                                     });
@@ -1975,36 +2512,49 @@ fn main() {
 
                                 egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.button("New").clicked() {
-                                            character = build_walking_pony();
-                                            player = AnimationPlayer::new();
-                                            player.play("Walk");
+                                        // Те же действия, что в меню File/Edit (раньше
+                                        // тулбарные Undo/Redo были навсегда выключены, а
+                                        // New/Open/Save молча глотали ошибки).
+                                        if ui.button("New").on_hover_text("Ctrl+N").clicked() {
+                                            actions.push(Action::New);
                                         }
-                                        if ui.button("Open").clicked() {
-                                            if let Ok(loaded) = Character::load_from_file(ASSET_PATH) {
-                                                character = loaded;
-                                                player = AnimationPlayer::new();
-                                            }
+                                        if ui.button("Open").on_hover_text(format!("Ctrl+O — {asset_path}")).clicked() {
+                                            actions.push(Action::Open);
                                         }
-                                        if ui.button("Save").clicked() {
-                                            let _ = character.save_to_file(ASSET_PATH);
+                                        if ui.button("Save").on_hover_text(format!("Ctrl+S — {asset_path}")).clicked() {
+                                            actions.push(Action::Save);
                                         }
-                                        ui.add_enabled(false, egui::Button::new("Undo"));
-                                        ui.add_enabled(false, egui::Button::new("Redo"));
-                                        ui.add_enabled(false, egui::Button::new("Publish"));
+                                        ui.separator();
+                                        if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
+                                            actions.push(Action::Undo);
+                                        }
+                                        if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Ctrl+Shift+Z / Ctrl+Y").clicked() {
+                                            actions.push(Action::Redo);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Export GIF").on_hover_text("gui_export.gif — текущая анимация").clicked() {
+                                            actions.push(Action::ExportGif);
+                                        }
                                         ui.separator();
                                         ui.label("Zoom:");
-                                        ui.add(egui::Slider::new(&mut stage_zoom, 0.25..=4.0).show_value(true));
-                                        ui.separator();
-                                        egui::ComboBox::from_label("Workspace").selected_text("Animator").show_ui(ui, |ui| {
-                                            let _ = ui.selectable_label(true, "Animator");
-                                        });
+                                        // Логарифмический и того же диапазона, что колесо мыши:
+                                        // раньше слайдер (0.25..4) каждый кадр зажимал зум,
+                                        // выставленный колесом, обратно в свой диапазон.
+                                        ui.add(
+                                            egui::Slider::new(&mut stage_zoom, MIN_STAGE_ZOOM..=MAX_STAGE_ZOOM)
+                                                .logarithmic(true)
+                                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                                .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)),
+                                        );
+                                        if ui.button("Fit").on_hover_text("Ctrl+3 — показать персонажа целиком").clicked() {
+                                            fit_request = Some(FitView::Character);
+                                        }
                                     });
                                 });
 
                                 egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("Инструмент: {}", active_tool.label()));
+                                        ui.label(format!("Инструмент: {}", active_tool.label())).on_hover_text(active_tool.hint());
                                         ui.separator();
                                         ui.label(format!("Выделение: {}", selected_layer.as_deref().unwrap_or("нет")));
                                         ui.separator();
@@ -2018,26 +2568,25 @@ fn main() {
 
                                 egui::TopBottomPanel::bottom("playback_bar").show(ctx, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.button("⏮").clicked() {
-                                            let cur = player.time();
-                                            player.advance(&character, -cur);
-                                            player.apply(&mut character);
+                                        if ui.button("⏮").on_hover_text("В начало (Home)").clicked() {
+                                            actions.push(Action::Rewind);
                                         }
-                                        if ui.button(if playing { "⏸" } else { "▶" }).clicked() {
-                                            playing = !playing;
+                                        if ui.button("◀|").on_hover_text("Кадр назад (Left)").clicked() {
+                                            actions.push(Action::PrevFrame);
                                         }
-                                        if ui.button("⏭").clicked() {
-                                            playing = false;
-                                            if let Some(anim) = player.current_name().and_then(|n| character.animations.get(n)) {
-                                                let dur = anim.duration;
-                                                let cur = player.time();
-                                                player.advance(&character, dur - cur);
-                                                player.apply(&mut character);
-                                            }
+                                        if ui.button(if playing { "⏸" } else { "▶" }).on_hover_text("Play/Pause (Space)").clicked() {
+                                            actions.push(Action::TogglePlay);
+                                        }
+                                        if ui.button("|▶").on_hover_text("Кадр вперёд (Right)").clicked() {
+                                            actions.push(Action::NextFrame);
+                                        }
+                                        if ui.button("⏭").on_hover_text("В конец (End)").clicked() {
+                                            actions.push(Action::GoToEnd);
                                         }
                                         ui.separator();
                                         let current_frame = (player.time() * FPS).round() as i64;
-                                        ui.label(format!("Кадр: {current_frame}"));
+                                        let total = player.current_name().and_then(|n| character.animations.get(n)).map(|a| (a.duration * FPS).round() as i64).unwrap_or(0);
+                                        ui.label(format!("Кадр: {current_frame} / {total}"));
                                         ui.separator();
                                         ui.label(format!("FPS: {FPS:.0}"));
                                         ui.separator();
@@ -2057,25 +2606,25 @@ fn main() {
                                 egui::SidePanel::left("tools").resizable(false).min_width(64.0).show(ctx, |ui| {
                                     ui.vertical_centered_justified(|ui| {
                                         for tool in [Tool::Selection, Tool::SubSelection, Tool::FreeTransform, Tool::Lasso] {
-                                            if ui.selectable_label(active_tool == tool, tool.label()).clicked() {
+                                            if ui.selectable_label(active_tool == tool, tool.label()).on_hover_text(tool.hint()).clicked() {
                                                 active_tool = tool;
                                             }
                                         }
                                         ui.separator();
                                         for tool in [Tool::Pen, Tool::Pencil, Tool::Brush, Tool::Line, Tool::Rectangle, Tool::Oval, Tool::PolyStar] {
-                                            if ui.selectable_label(active_tool == tool, tool.label()).clicked() {
+                                            if ui.selectable_label(active_tool == tool, tool.label()).on_hover_text(tool.hint()).clicked() {
                                                 active_tool = tool;
                                             }
                                         }
                                         ui.separator();
                                         for tool in [Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper] {
-                                            if ui.selectable_label(active_tool == tool, tool.label()).clicked() {
+                                            if ui.selectable_label(active_tool == tool, tool.label()).on_hover_text(tool.hint()).clicked() {
                                                 active_tool = tool;
                                             }
                                         }
                                         ui.separator();
                                         for tool in [Tool::Hand, Tool::Zoom] {
-                                            if ui.selectable_label(active_tool == tool, tool.label()).clicked() {
+                                            if ui.selectable_label(active_tool == tool, tool.label()).on_hover_text(tool.hint()).clicked() {
                                                 active_tool = tool;
                                             }
                                         }
@@ -2089,7 +2638,11 @@ fn main() {
                                         }
                                         ui.separator();
                                         ui.label(format!("SVG: {} фигур(ы)", vector_doc.shapes.len()));
-                                        if ui.button("Сохранить как слой").clicked() && !vector_doc.is_empty() {
+                                        if ui
+                                            .add_enabled(!vector_doc.is_empty(), egui::Button::new("Сохранить как слой"))
+                                            .on_disabled_hover_text("Сначала нарисуй что-нибудь (Rect/Oval/Pen/...)")
+                                            .clicked()
+                                        {
                                             let (min_x, min_y, max_x, max_y) = vector_doc.bounds().unwrap_or((0.0, 0.0, 1.0, 1.0));
                                             let draw_center = glam::Vec2::new((min_x + max_x) / 2.0, -(min_y + max_y) / 2.0);
                                             let draw_size = glam::Vec2::new((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
@@ -2107,9 +2660,9 @@ fn main() {
                                                     if let pony_core::part::PartSource::Vector { path } = &part.source {
                                                         match std::fs::write(path, vector_doc.to_svg_string()) {
                                                             Ok(()) => {
-                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                                 pony_renderer.invalidate_texture(path);
-                                                                let bone_world = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)).unwrap_or_default();
+                                                                force_render = true;
+                                                                let bone_world = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)).unwrap_or_default();
                                                                 let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
                                                                 if let Some(p) = character.parts.get_mut(&edit_id) {
                                                                     p.pivot = pivot;
@@ -2132,11 +2685,14 @@ fn main() {
                                                 }
                                             } else {
                                                 svg_save_count += 1;
-                                                let path = format!("drawn_{svg_save_count}.svg");
+                                                // Не занятый ни частью, ни файлом на диске (иначе
+                                                // перезаписали бы .svg уже существующей части).
+                                                let part_id = unique_name(&format!("drawn_{svg_save_count}"), |c| {
+                                                    character.parts.contains_key(c) || std::path::Path::new(&format!("{c}.svg")).exists()
+                                                });
+                                                let path = format!("{part_id}.svg");
                                                 match std::fs::write(&path, vector_doc.to_svg_string()) {
                                                     Ok(()) => {
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
-                                                        let part_id = format!("drawn_{svg_save_count}");
 
                                                         // Часть должна встать ТУДА, где нарисована, и
                                                         // ТОГО размера, какого нарисована — иначе
@@ -2150,7 +2706,7 @@ fn main() {
                                                             .and_then(|id| character.parts.get(id))
                                                             .and_then(|p| p.bone.clone())
                                                             .unwrap_or_else(|| "Body".to_string());
-                                                        let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
+                                                        let bone_world = character.skeleton.world_transform_with_ik(&bone_id).unwrap_or_default();
                                                         let pivot = pony_render::pivot_for_world_position(draw_center, &bone_world);
 
                                                         let max_layer = character.parts.values().map(|p| p.layer).max().unwrap_or(0);
@@ -2181,7 +2737,7 @@ fn main() {
                                                 status_message = "Редактирование отменено".into();
                                             }
                                         }
-                                        if ui.button("Очистить холст").clicked() {
+                                        if ui.add_enabled(!vector_doc.is_empty(), egui::Button::new("Очистить холст")).clicked() {
                                             vector_doc.clear();
                                         }
                                     });
@@ -2260,14 +2816,13 @@ fn main() {
                                                         });
                                                         if let Some(target_bone) = new_bone {
                                                             if Some(&target_bone) != part.bone.as_ref() {
-                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                                 let old_world = part
                                                                     .bone
                                                                     .as_ref()
-                                                                    .and_then(|b| character.skeleton.world_transform(b))
+                                                                    .and_then(|b| character.skeleton.world_transform_with_ik(b))
                                                                     .unwrap_or_default();
                                                                 let keep_at = pony_render::part_world_position(&part, &old_world);
-                                                                let new_world = character.skeleton.world_transform(&target_bone).unwrap_or_default();
+                                                                let new_world = character.skeleton.world_transform_with_ik(&target_bone).unwrap_or_default();
                                                                 let new_pivot = pony_render::pivot_for_world_position(keep_at, &new_world);
                                                                 if let Some(p) = character.parts.get_mut(&id) {
                                                                     p.bone = Some(target_bone.clone());
@@ -2346,7 +2901,6 @@ fn main() {
                                                         });
                                                         if let Some(target_mask) = new_mask {
                                                             if target_mask != part.clip_by {
-                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                                 if let Some(p) = character.parts.get_mut(&id) {
                                                                     p.clip_by = target_mask.clone();
                                                                 }
@@ -2406,7 +2960,13 @@ fn main() {
                                             }
                                             RightTab::Transform => {
                                                 ui.label("Поворот персонажа (2.5D, раздел 8 ТЗ):");
-                                                ui.add(egui::Slider::new(&mut facing_yaw_deg, -89.0..=89.0).suffix("°"));
+                                                // Слайдер правит сам character.facing_yaw (раньше —
+                                                // отдельную UI-переменную, которая каждый кадр
+                                                // затирала значение из открытого .asset и из Undo).
+                                                let mut facing_yaw_deg = character.facing_yaw.to_degrees();
+                                                if ui.add(egui::Slider::new(&mut facing_yaw_deg, -89.0..=89.0).suffix("°")).changed() {
+                                                    character.facing_yaw = facing_yaw_deg.to_radians();
+                                                }
                                                 ui.separator();
                                                 match &selected_layer {
                                                     Some(id) => {
@@ -2441,12 +3001,12 @@ fn main() {
                                                     mouse_stage_pos.map(|p| format!("{:.0}, {:.0}", p.x, p.y)).unwrap_or_else(|| "—".into())
                                                 ));
                                                 ui.label(format!("Zoom: {:.0}%", stage_zoom * 100.0));
-                                                ui.label(format!("Инструмент: {}", active_tool.label()));
+                                                ui.label(format!("Инструмент: {}", active_tool.label())).on_hover_text(active_tool.hint());
                                                 if let Some(id) = &selected_layer {
                                                     ui.label(format!("Выбран слой: {id}"));
                                                     if let Some(part) = character.parts.get(id) {
                                                         if let Some(bone_id) = &part.bone {
-                                                            if let Some(world) = character.skeleton.world_transform(bone_id) {
+                                                            if let Some(world) = character.skeleton.world_transform_with_ik(bone_id) {
                                                                 ui.label(format!("Мировая позиция: {:.1}, {:.1}", world.position.x, world.position.y));
                                                             }
                                                         }
@@ -2461,6 +3021,7 @@ fn main() {
                                                         Ok(commands) => {
                                                             let n = commands.len();
                                                             pony_script::apply_commands(&mut character, &mut camera, &mut player, &commands);
+                                                            take_blink(&mut character, &mut blink_timer);
                                                             script_log = format!("OK: выполнено {n} команд(ы)");
                                                         }
                                                         Err(err) => script_log = format!("Ошибка: {err}"),
@@ -2556,22 +3117,30 @@ fn main() {
 
                                                         let is_root = character.skeleton.find(&bid).and_then(|b| b.parent.clone()).is_none();
                                                         if ui.add_enabled(!is_root, egui::Button::new("Удалить кость (и поддерево)")).clicked() {
-                                                            push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                             let parent_id = character.skeleton.find(&bid).and_then(|b| b.parent.clone());
                                                             // Сохраняем мировые позиции частей, которые
                                                             // висели на удаляемых костях, ДО удаления —
                                                             // иначе их нечем будет пересчитать после.
+                                                            let doomed: Vec<String> = character.skeleton.bones.iter().filter(|b| character.skeleton.is_descendant_of(&b.id, &bid)).map(|b| b.id.clone()).collect();
+                                                            let keep_at: Vec<(String, glam::Vec2)> = character
+                                                                .parts
+                                                                .values()
+                                                                .filter(|p| p.bone.as_ref().is_some_and(|b| doomed.contains(b)))
+                                                                .filter_map(|p| {
+                                                                    let w = character.skeleton.world_transform_with_ik(p.bone.as_ref()?)?;
+                                                                    Some((p.id.clone(), pony_render::part_world_position(p, &w)))
+                                                                })
+                                                                .collect();
                                                             let removed = character.skeleton.remove_subtree(&bid);
                                                             if let Some(parent_id) = parent_id {
-                                                                for part in character.parts.values_mut() {
-                                                                    let Some(part_bone) = &part.bone else { continue };
-                                                                    if removed.contains(part_bone) {
-                                                                        // Кость уже удалена — её world_transform
-                                                                        // больше не посчитать, поэтому переносим
-                                                                        // часть на родителя с тем же смещением
-                                                                        // (примерно на месте, не идеально точно,
-                                                                        // но не телепортирует непредсказуемо).
+                                                                // Части удалённых костей переходят к родителю и
+                                                                // остаются там же на экране (раньше смещение
+                                                                // переносилось как есть, и часть прыгала).
+                                                                let parent_world = character.skeleton.world_transform_with_ik(&parent_id).unwrap_or_default();
+                                                                for (part_id, world_pos) in keep_at {
+                                                                    if let Some(part) = character.parts.get_mut(&part_id) {
                                                                         part.bone = Some(parent_id.clone());
+                                                                        part.pivot = pony_render::pivot_for_world_position(world_pos, &parent_world);
                                                                     }
                                                                 }
                                                             }
@@ -2589,7 +3158,6 @@ fn main() {
                                                         if ui.button("Применить имя").clicked() {
                                                             if bone_rename_buf != bid && !bone_rename_buf.trim().is_empty() {
                                                                 let new_id = bone_rename_buf.trim().to_string();
-                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                                 if character.skeleton.rename_bone(&bid, &new_id) {
                                                                     for part in character.parts.values_mut() {
                                                                         if part.bone.as_deref() == Some(bid.as_str()) {
@@ -2631,8 +3199,17 @@ fn main() {
                                                             });
                                                         if let Some(np) = new_parent {
                                                             if Some(&np) != current_parent.as_ref() {
-                                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                                                let world_before = character.skeleton.world_transform(&bid);
                                                                 if character.skeleton.reparent(&bid, &np) {
+                                                                    // Кость остаётся на месте на экране: локальная поза
+                                                                    // пересчитывается под нового родителя (раньше
+                                                                    // старая локальная поза улетала вместе с ним).
+                                                                    if let (Some(before), Some(parent_world)) = (world_before, character.skeleton.world_transform(&np)) {
+                                                                        if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bid) {
+                                                                            bone.local_transform.position = pony_render::pivot_for_world_position(before.position, &parent_world);
+                                                                            bone.local_transform.rotation = before.rotation - parent_world.rotation;
+                                                                        }
+                                                                    }
                                                                     status_message = format!("'{bid}' теперь дочерняя для '{np}'");
                                                                 } else {
                                                                     status_message = "Нельзя: это создало бы цикл в иерархии".into();
@@ -2730,12 +3307,19 @@ fn main() {
                                                             }
                                                         });
                                                     });
-                                                    let can_create = ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some();
+                                                    // Root/Mid/Tip должны быть тремя разными костями: при
+                                                    // совпадении длина звена нулевая, и решатель IK
+                                                    // раньше превращал позу цепочки в NaN (части пропадали).
+                                                    let distinct = ik_new_root != ik_new_mid && ik_new_mid != ik_new_tip && ik_new_root != ik_new_tip;
+                                                    let can_create = ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some() && distinct;
+                                                    if ik_new_root.is_some() && ik_new_mid.is_some() && ik_new_tip.is_some() && !distinct {
+                                                        ui.colored_label(egui::Color32::from_rgb(230, 150, 90), "Root, Mid и Tip должны быть разными костями");
+                                                    }
                                                     if ui.add_enabled(can_create, egui::Button::new("+ Создать IK-констрейнт")).clicked() {
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                         let (root, mid, tip) = (ik_new_root.take().unwrap(), ik_new_mid.take().unwrap(), ik_new_tip.take().unwrap());
-                                                        let tip_world = character.skeleton.world_transform(&tip).unwrap_or_default();
-                                                        let mut constraint = pony_core::IkConstraint::new(format!("ik_{}", character.skeleton.ik_constraints.len() + 1), root, mid, tip);
+                                                        let tip_world = character.skeleton.world_transform_with_ik(&tip).unwrap_or_default();
+                                                        let ik_id = unique_name(&format!("ik_{}", character.skeleton.ik_constraints.len() + 1), |c| character.skeleton.ik_constraints.iter().any(|k| k.id == c));
+                                                        let mut constraint = pony_core::IkConstraint::new(ik_id, root, mid, tip);
                                                         // Target по умолчанию — текущая мировая позиция tip
                                                         // (нога не дёргается в момент создания констрейнта).
                                                         constraint.target = tip_world.position;
@@ -2744,7 +3328,6 @@ fn main() {
                                                     }
                                                 });
                                                 if let Some(id) = ik_to_remove.take() {
-                                                    push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                     character.skeleton.remove_ik_constraint(&id);
                                                     status_message = format!("IK-констрейнт '{id}' удалён");
                                                 }
@@ -2932,7 +3515,6 @@ fn main() {
                                                         }
                                                     });
                                                     if let Some(id) = ungroup_id {
-                                                        push_undo(&mut undo_stack, &mut redo_stack, &character);
                                                         character.ungroup(&id);
                                                         status_message = "Группа разгруппирована — части остались на месте".into();
                                                     }
@@ -3216,6 +3798,113 @@ fn main() {
                                     });
                                 }
 
+                                // --- окно импорта Adobe Animate ---
+                                if xfl_window_open {
+                                    let mut open = true;
+                                    egui::Window::new("Импорт Adobe Animate").open(&mut open).default_width(640.0).default_pos(egui::pos2(220.0, 70.0)).show(ctx, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Файл .fla / .xfl / папка XFL:");
+                                            let r = ui.add(egui::TextEdit::singleline(&mut xfl_path).desired_width(330.0).hint_text("../alkash3d-engine/assets/mlp/fla/....fla"));
+                                            if ui.button("Загрузить").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                                xfl_load_request = true;
+                                            }
+                                        });
+                                        if !xfl_info.is_empty() {
+                                            ui.small(&xfl_info);
+                                        }
+                                        let Some(doc) = &xfl_doc else {
+                                            ui.weak("Диалога выбора файла нет — впиши путь (относительно папки запуска или абсолютный) и нажми «Загрузить».");
+                                            return;
+                                        };
+                                        ui.separator();
+                                        ui.horizontal_top(|ui| {
+                                            // Левая колонка: символы библиотеки.
+                                            ui.vertical(|ui| {
+                                                ui.set_width(230.0);
+                                                ui.add(egui::TextEdit::singleline(&mut xfl_filter).hint_text("поиск символа…"));
+                                                egui::ScrollArea::vertical().id_source("xfl_symbols").max_height(380.0).show(ui, |ui| {
+                                                    if ui.selectable_label(xfl_symbol.is_none(), format!("(главная шкала, {} кадр.)", doc.main.frame_count())).clicked() {
+                                                        xfl_symbol = None;
+                                                        xfl_frame = 0;
+                                                    }
+                                                    let filter = xfl_filter.to_lowercase();
+                                                    // Контейнеры "~..." (персонаж, голова) — первыми.
+                                                    let mut names = doc.symbol_names();
+                                                    names.sort_by_key(|n| (!n.starts_with('~'), n.to_lowercase()));
+                                                    for name in names.into_iter().filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter)) {
+                                                        let frames = doc.symbols[name].frame_count();
+                                                        if ui.selectable_label(xfl_symbol.as_deref() == Some(name), format!("{name}  ·{frames}")).clicked() {
+                                                            xfl_symbol = Some(name.to_string());
+                                                            xfl_frame = 0;
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            ui.separator();
+                                            // Правая колонка: кадр, превью, параметры.
+                                            ui.vertical(|ui| {
+                                                let Some(tl) = doc.timeline(xfl_symbol.as_deref()) else { return };
+                                                let count = tl.frame_count();
+                                                xfl_frame = xfl_frame.min(count - 1);
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Кадр:");
+                                                    ui.add(egui::Slider::new(&mut xfl_frame, 0..=count - 1));
+                                                    if ui.small_button("◀").clicked() {
+                                                        xfl_frame = xfl_frame.saturating_sub(1);
+                                                    }
+                                                    if ui.small_button("▶").clicked() {
+                                                        xfl_frame = (xfl_frame + 1).min(count - 1);
+                                                    }
+                                                });
+                                                let labels = tl.frame_labels();
+                                                if !labels.is_empty() {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.weak("Метки:");
+                                                        for (idx, label) in &labels {
+                                                            if ui.small_button(format!("{label} ({idx})")).clicked() {
+                                                                xfl_frame = *idx;
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                // Превью перерисовывается только при смене символа/кадра.
+                                                let key = (xfl_symbol.clone(), xfl_frame);
+                                                if xfl_preview_key.as_ref() != Some(&key) {
+                                                    xfl_preview_key = Some(key);
+                                                    xfl_preview = doc
+                                                        .render_svg(xfl_symbol.as_deref(), xfl_frame)
+                                                        .and_then(|r| pony_render::rasterize_svg_rgba(&r.svg, 360))
+                                                        .map(|(w, h, rgba)| ctx.load_texture("xfl-preview", egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba), egui::TextureOptions::LINEAR));
+                                                }
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(370.0, 300.0), egui::Sense::hover());
+                                                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(235));
+                                                match &xfl_preview {
+                                                    Some(tex) => {
+                                                        let size = tex.size_vec2();
+                                                        let k = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
+                                                        let img = egui::Rect::from_center_size(rect.center(), size * k);
+                                                        ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                                                    }
+                                                    None => {
+                                                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "(пустой кадр)", egui::FontId::proportional(13.0), egui::Color32::from_gray(90));
+                                                    }
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Масштаб:");
+                                                    ui.add(egui::DragValue::new(&mut xfl_opts.scale).speed(0.01).clamp_range(0.01..=10.0)).on_hover_text("Мировых единиц на пиксель Animate");
+                                                    ui.checkbox(&mut xfl_opts.expand_containers, "Раскрыть «~»-контейнеры")
+                                                        .on_hover_text("Вложенные символы с именем на «~» (например ~RD_Head) раскладываются на отдельные части: глаза, рот, брови…");
+                                                });
+                                                ui.small("Каждый слой станет частью со своей костью в точке трансформации Animate — её можно двигать, вращать и анимировать.");
+                                                if ui.button("Импортировать как нового персонажа").clicked() {
+                                                    actions.push(Action::ImportXfl);
+                                                }
+                                            });
+                                        });
+                                    });
+                                    xfl_window_open = open;
+                                }
+
                                 // Timeline — TopBottomPanel::bottom, но добавлена ЗДЕСЬ,
                                 // после боковых панелей, а не раньше них. Раньше стояла
                                 // перед SidePanel::left/right — из-за чего при своей
@@ -3252,6 +3941,8 @@ fn main() {
                                                 active_character_name = new_name;
                                                 selected_layer = None;
                                                 selected_bone = None;
+                                                history.reset(&character, &vector_doc);
+                                                fit_request = Some(FitView::Character);
                                                 status_message = format!("Создан персонаж '{active_character_name}'");
                                             }
                                             if ui.add_enabled(!other_characters.is_empty(), egui::Button::new("Удалить активного")).clicked() {
@@ -3261,6 +3952,7 @@ fn main() {
                                                     let deleted_name = std::mem::replace(&mut active_character_name, next.name);
                                                     selected_layer = None;
                                                     selected_bone = None;
+                                                    history.reset(&character, &vector_doc);
                                                     status_message = format!("Персонаж '{deleted_name}' удалён, активен '{active_character_name}'");
                                                 }
                                             }
@@ -3297,6 +3989,7 @@ fn main() {
                                                 &mut timeline_zoom,
                                                 &mut selected_keyframe,
                                                 &mut timeline_channel,
+                                                &selected_bone,
                                             );
                                         }
 
@@ -3313,6 +4006,7 @@ fn main() {
                                             selected_layer = None;
                                             selected_bone = None;
                                             timeline_mode_all = false; // drill-down: сразу в таймлайн выбранного
+                                            history.reset(&character, &vector_doc);
                                             status_message = format!("Активен '{active_character_name}'");
                                         }
                                     });
@@ -3326,43 +4020,142 @@ fn main() {
                                     // ВАЖНО: painter_at(avail), не голый ui.painter() — иначе при
                                     // увеличении/панорамировании Stage сцена и оверлеи (линии
                                     // скелета, превью фигур) рисуются БЕЗ обрезки по границам
-                                    // CentralPanel и протекают поверх меню сверху и палитры
-                                    // инструментов слева. Само это не влияло на данные (кости и
-                                    // фигуры считались верно), только на то, что видно на экране —
-                                    // но видно было неверно, и это заметил бы любой, кто увеличил Stage.
+                                    // CentralPanel и протекают поверх меню и палитры инструментов.
                                     let painter = ui.painter_at(avail);
                                     let painter = &painter;
 
                                     painter.rect_filled(avail, 0.0, egui::Color32::from_gray(38));
 
-                                    if active_tool == Tool::Hand && response.dragged() {
+                                    // --- навигация по Stage ---
+                                    // Пан: инструмент Hand ИЛИ средняя кнопка мыши в любом
+                                    // инструменте (раньше, чтобы сдвинуть вид, приходилось
+                                    // каждый раз переключаться на Hand и обратно).
+                                    if (active_tool == Tool::Hand && response.dragged_by(egui::PointerButton::Primary)) || response.dragged_by(egui::PointerButton::Middle) {
                                         stage_pan += response.drag_delta();
                                     }
-                                    if response.hovered() {
-                                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                                        if scroll != 0.0 {
-                                            stage_zoom = (stage_zoom * (1.0 + scroll * 0.001)).clamp(0.1, 8.0);
+                                    // Зум колесом (и Ctrl+колесо / жестом) — К КУРСОРУ, а не к
+                                    // центру: точка под мышью остаётся на месте. Раньше зум шёл к
+                                    // центру холста, и мелкую деталь приходилось ловить паном.
+                                    let zoom_around = |stage_zoom: &mut f32, stage_pan: &mut egui::Vec2, factor: f32, anchor: egui::Pos2| {
+                                        let new_zoom = (*stage_zoom * factor).clamp(MIN_STAGE_ZOOM, MAX_STAGE_ZOOM);
+                                        let k = new_zoom / *stage_zoom;
+                                        let from_center = anchor - canvas_rect.center();
+                                        *stage_pan = from_center - (from_center - *stage_pan) * k;
+                                        *stage_zoom = new_zoom;
+                                    };
+                                    if let Some(hover) = response.hover_pos() {
+                                        let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+                                        let factor = pinch * (scroll * 0.0015).exp();
+                                        if (factor - 1.0).abs() > 1e-4 {
+                                            zoom_around(&mut stage_zoom, &mut stage_pan, factor, hover);
                                         }
                                     }
-                                    if active_tool == Tool::Zoom && response.clicked() {
-                                        stage_zoom = (stage_zoom * 1.25).clamp(0.1, 8.0);
+                                    if active_tool == Tool::Zoom {
+                                        if let Some(pos) = response.interact_pointer_pos() {
+                                            if response.clicked() {
+                                                zoom_around(&mut stage_zoom, &mut stage_pan, 1.25, pos);
+                                            } else if response.secondary_clicked() {
+                                                zoom_around(&mut stage_zoom, &mut stage_pan, 1.0 / 1.25, pos);
+                                            }
+                                        }
                                     }
+                                    if let Some(fit) = fit_request.take() {
+                                        match fit {
+                                            FitView::Document => {
+                                                stage_zoom = (canvas_rect.width() / SCENE_WIDTH as f32).min(canvas_rect.height() / SCENE_HEIGHT as f32) * 0.95;
+                                                stage_pan = egui::Vec2::ZERO;
+                                            }
+                                            FitView::Character => {
+                                                if let Some((lo, hi)) = character_bounds(&character, &hidden_layers) {
+                                                    let size = (hi - lo).max(glam::Vec2::splat(1.0)) * camera.zoom.max(0.0001);
+                                                    stage_zoom = ((canvas_rect.width() / size.x).min(canvas_rect.height() / size.y) * 0.6).clamp(MIN_STAGE_ZOOM, MAX_STAGE_ZOOM);
+                                                    // Центр габарита -> центр холста (та же формула, что
+                                                    // world_to_screen ниже, только решённая относительно пана).
+                                                    let c = (lo + hi) / 2.0 - camera.position;
+                                                    let (sr, cr) = camera.rotation.sin_cos();
+                                                    let v = glam::Vec2::new(c.x * cr + c.y * sr, -c.x * sr + c.y * cr) * camera.zoom * stage_zoom;
+                                                    stage_pan = egui::vec2(-v.x, v.y);
+                                                } else {
+                                                    stage_pan = egui::Vec2::ZERO;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    stage_zoom = stage_zoom.clamp(MIN_STAGE_ZOOM, MAX_STAGE_ZOOM);
 
                                     let stage_w = SCENE_WIDTH as f32 * stage_zoom;
                                     let stage_h = SCENE_HEIGHT as f32 * stage_zoom;
                                     let center = canvas_rect.center() + stage_pan;
                                     let stage_rect = egui::Rect::from_center_size(center, egui::vec2(stage_w, stage_h));
 
-                                    // Сцена рисуется ПЕРВОЙ — до всех блоков инструментов,
-                                    // потому что живое превью фигуры (Rect/Oval/Line/Pencil)
-                                    // рисуется прямо внутри этих блоков и должно ложиться
-                                    // ПОВЕРХ сцены. Раньше картинка сцены рисовалась после
-                                    // них и полностью перекрывала превью — из-за чего
-                                    // казалось, что фигура появляется только после отпускания
-                                    // кнопки мыши (на самом деле она рисовалась всё время,
-                                    // просто была не видна под сценой).
+                                    // --- рендер сцены в разрешении экрана ---
+                                    // Кадр покрывает весь видимый холст, а камера для него —
+                                    // камера документа, домноженная на зум Stage и сдвинутая
+                                    // на пан. Геометрически это ровно то же отображение мир->экран,
+                                    // что и раньше (см. screen_to_world/world_to_screen ниже), но
+                                    // растеризованное в пикселях экрана: персонаж чёткий на любом
+                                    // зуме, а не растянутая картинка 960x720.
+                                    let ppp = ctx.pixels_per_point();
+                                    let render_w = ((canvas_rect.width() * ppp).round() as u32).clamp(1, 4096);
+                                    let render_h = ((canvas_rect.height() * ppp).round() as u32).clamp(1, 4096);
+                                    let image_rect = egui::Rect::from_min_size(canvas_rect.min, egui::vec2(render_w as f32, render_h as f32) / ppp);
+                                    let mut view_camera = camera;
+                                    {
+                                        let s = camera.zoom.max(0.0001) * stage_zoom;
+                                        let d_screen = center - image_rect.center();
+                                        let d = glam::Vec2::new(d_screen.x, -d_screen.y) / s;
+                                        let (sr, cr) = camera.rotation.sin_cos();
+                                        view_camera.position = camera.position - glam::Vec2::new(d.x * cr - d.y * sr, d.x * sr + d.y * cr);
+                                        view_camera.zoom = s * ppp;
+                                    }
+                                    let up_to_date = last_render_key.as_ref().is_some_and(|k| {
+                                        k.size == (render_w, render_h) && k.camera == view_camera && k.lighting == lighting && k.hidden == hidden_layers && k.character == character
+                                    });
+                                    let animated_fx = particles_enabled || camera.shake_intensity > 0.0 || blink_timer > 0.0;
+                                    if !up_to_date || animated_fx || force_render {
+                                        force_render = false;
+                                        let mut visible_character = character.clone();
+                                        // Часть скрыта, если скрыта ОНА САМА или группа, в
+                                        // которую она входит (по всей цепочке родителей, см.
+                                        // `Character::is_part_hidden_by_group`).
+                                        visible_character.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
+                                        if blink_timer > 0.0 {
+                                            // 0 -> 1 (закрыт) -> 0 за время моргания
+                                            let phase = 1.0 - blink_timer / BLINK_SECONDS;
+                                            let closed = (phase * std::f32::consts::PI).sin();
+                                            let current = visible_character.default_morph.get("Blink");
+                                            visible_character.default_morph.set("Blink", current.max(closed));
+                                        }
+                                        let particles_arg = if particles_enabled { Some(&particle_emitter) } else { None };
+                                        let rendered = pony_renderer.render_character(&gpu_ctx, &visible_character, render_w, render_h, &view_camera, elapsed_time, &lighting, particles_arg);
+                                        let color_image = egui::ColorImage::from_rgba_unmultiplied([rendered.width as usize, rendered.height as usize], &rendered.rgba);
+                                        match &mut scene_texture {
+                                            Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
+                                            None => scene_texture = Some(ctx.load_texture("pony-scene", color_image, egui::TextureOptions::LINEAR)),
+                                        }
+                                        last_frame_output = Some(rendered);
+                                        last_render_key = Some(RenderKey { character: character.clone(), hidden: hidden_layers.clone(), camera: view_camera, lighting: lighting.clone(), size: (render_w, render_h) });
+                                    }
+                                    scene_image_rect = image_rect;
+
+                                    // Сцена рисуется ПЕРВОЙ — до всех блоков инструментов:
+                                    // живое превью фигуры (Rect/Oval/Line/Pencil) рисуется прямо
+                                    // внутри этих блоков и должно ложиться ПОВЕРХ сцены.
                                     if let Some(tex) = &scene_texture {
-                                        painter.image(tex.id(), stage_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                                        painter.image(tex.id(), image_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                                    }
+                                    // Всё вне экспортной области документа притемнено — видно,
+                                    // что попадёт в GIF/спрайт-лист, а что нет.
+                                    let outside = egui::Color32::from_rgba_unmultiplied(30, 30, 34, 200);
+                                    let c = canvas_rect;
+                                    let st = stage_rect.intersect(c);
+                                    if st.is_positive() {
+                                        painter.rect_filled(egui::Rect::from_min_max(c.min, egui::pos2(c.right(), st.top())), 0.0, outside);
+                                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(c.left(), st.bottom()), c.max), 0.0, outside);
+                                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(c.left(), st.top()), egui::pos2(st.left(), st.bottom())), 0.0, outside);
+                                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(st.right(), st.top()), egui::pos2(c.right(), st.bottom())), 0.0, outside);
+                                    } else {
+                                        painter.rect_filled(c, 0.0, outside);
                                     }
 
                                     // Перевод экранных координат в мировые координаты сцены —
@@ -3370,7 +4163,7 @@ fn main() {
                                     // shake), что и в Renderer::render_character (см. compute_projection
                                     // в pony-render), только в обратную сторону. Не инвертируем сам
                                     // 2.5D-поворот (facing_yaw) — сравниваем клик с уже повёрнутыми
-                                    // координатами частей (см. ниже), так проще и корректно.
+                                    // координатами частей (см. part_at), так проще и корректно.
                                     let inv_zoom = 1.0 / camera.zoom.max(0.0001);
                                     let shake = camera.shake_offset(elapsed_time);
                                     let (sin_r, cos_r) = camera.rotation.sin_cos();
@@ -3395,68 +4188,146 @@ fn main() {
                                         let frame_px_y = SCENE_HEIGHT as f32 / 2.0 - after_cam.y;
                                         egui::pos2(stage_rect.left() + frame_px_x * stage_zoom, stage_rect.top() + frame_px_y * stage_zoom)
                                     };
+                                    // Точка, где РЕАЛЬНО нажали кнопку мыши. Для начала drag'а
+                                    // это важно: egui признаёт жест драгом только после порога
+                                    // сдвига, и `interact_pointer_pos()` в этот момент уже уехал —
+                                    // прямоугольники начинались не там, где нажал, а лассо и
+                                    // захват узлов промахивались.
+                                    let press_origin = ui.input(|i| i.pointer.press_origin());
 
                                     if active_tool == Tool::Selection {
-                                        // Клик — выбрать часть под курсором.
+                                        // Клик — выбрать часть под курсором (или снять выбор).
                                         if response.clicked() {
                                             if let Some(screen_pos) = response.interact_pointer_pos() {
-                                                let click_world = screen_to_world(screen_pos);
-                                                let mut best: Option<(String, i32)> = None;
-                                                for (id, part) in &character.parts {
-                                                    if locked_layers.contains(id) || hidden_layers.contains(id) {
-                                                        continue;
-                                                    }
-                                                    let Some(bone_id) = &part.bone else { continue };
-                                                    let Some(world) = character.skeleton.world_transform(bone_id) else { continue };
-                                                    // Та же формула, что и у рендера — см.
-                                                    // part_world_position в pony-render.
-                                                    let part_pos = pony_render::part_world_position(part, &world);
-                                                    let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
-                                                    let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
-                                                    let size = pony_render::part_render_size(part);
-                                                    let half_w = (size.x * world.scale.x.abs() * foreshorten / 2.0).max(2.0);
-                                                    let half_h = (size.y * world.scale.y.abs() / 2.0).max(2.0);
-                                                    if (yawed_x - click_world.x).abs() <= half_w && (part_pos.y - click_world.y).abs() <= half_h {
-                                                        let better = best.as_ref().map(|(_, l)| part.layer > *l).unwrap_or(true);
-                                                        if better {
-                                                            best = Some((id.clone(), part.layer));
-                                                        }
-                                                    }
-                                                }
-                                                selected_layer = best.map(|(id, _)| id);
-
+                                                selected_layer = part_at(&character, &hidden_layers, &locked_layers, screen_to_world(screen_pos));
                                             }
                                         }
 
                                         // Перетаскивание — двигать САМУ ЧАСТЬ (её смещение
-                                        // относительно кости), а не кость: инструмент Xform
-                                        // двигает кость и утаскивает всё, что к ней прикреплено,
-                                        // а здесь нужно подвинуть один конкретный элемент.
-                                        if response.drag_started() {
-                                            if selected_layer.is_some() {
-                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
-                                            }
-                                        }
-                                        if response.dragged() {
-                                            if let (Some(id), Some(pos)) = (selected_layer.clone(), response.interact_pointer_pos()) {
-                                                if !locked_layers.contains(&id) {
-                                                    let target = screen_to_world(pos);
-                                                    let bone_id = character.parts.get(&id).and_then(|p| p.bone.clone());
-                                                    if let Some(bone_id) = bone_id {
-                                                        let bone_world = character.skeleton.world_transform(&bone_id).unwrap_or_default();
-                                                        let new_pivot = pony_render::pivot_for_world_position(target, &bone_world);
-                                                        if let Some(p) = character.parts.get_mut(&id) {
-                                                            p.pivot = new_pivot;
-                                                        }
+                                        // относительно кости), а не кость (это делает Xform).
+                                        // Раньше тащилась ПРЕДЫДУЩАЯ выбранная часть, даже если
+                                        // нажал на другую, и её центр прыгал под курсор. Теперь
+                                        // на старте драга выбирается часть под точкой нажатия, а
+                                        // смещение захвата сохраняется — часть едет за мышью
+                                        // ровно с того места, за которое взяли.
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
+                                            grab_offset = None;
+                                            if let Some(origin) = press_origin {
+                                                let press_world = screen_to_world(origin);
+                                                let hit = part_at(&character, &hidden_layers, &locked_layers, press_world);
+                                                if hit.is_some() {
+                                                    selected_layer = hit;
+                                                }
+                                                if let Some(part) = selected_layer.as_ref().filter(|id| !locked_layers.contains(*id)).and_then(|id| character.parts.get(id)) {
+                                                    if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
+                                                        grab_offset = Some(pony_render::part_world_position(part, &world) - press_world);
                                                     }
                                                 }
                                             }
                                         }
+                                        if response.dragged_by(egui::PointerButton::Primary) {
+                                            if let (Some(id), Some(offset), Some(pos)) = (selected_layer.clone(), grab_offset, response.interact_pointer_pos()) {
+                                                let target = screen_to_world(pos) + offset;
+                                                let bone_id = character.parts.get(&id).and_then(|p| p.bone.clone());
+                                                if let Some(bone_id) = bone_id {
+                                                    let bone_world = character.skeleton.world_transform_with_ik(&bone_id).unwrap_or_default();
+                                                    let new_pivot = pony_render::pivot_for_world_position(target, &bone_world);
+                                                    if let Some(p) = character.parts.get_mut(&id) {
+                                                        p.pivot = new_pivot;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) {
+                                            grab_offset = None;
+                                        }
                                     }
 
-                                    if active_tool == Tool::FreeTransform && response.dragged() {
-                                        if let Some(id) = &selected_layer {
-                                            if let Some(bone_id) = character.parts.get(id).and_then(|p| p.bone.clone()) {
+                                    if active_tool == Tool::FreeTransform {
+                                        // Что двигаем/вращаем — решается в момент нажатия:
+                                        // точка кости (если скелет показан) -> эта кость;
+                                        // часть -> её кость, с Alt — кость-родитель (у
+                                        // импортированных из Animate паппетов это контейнер:
+                                        // Alt+клик по глазу берёт всю голову); пустое место —
+                                        // кость выбранного слоя. Цель — `selected_bone`.
+                                        if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
+                                            if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
+                                                let alt = ui.input(|i| i.modifiers.alt);
+                                                let bone_hit = if show_skeleton {
+                                                    character
+                                                        .skeleton
+                                                        .bones
+                                                        .iter()
+                                                        .filter_map(|b| character.skeleton.world_transform_with_ik(&b.id).map(|w| (b.id.clone(), world_to_screen(w.position).distance(origin))))
+                                                        .filter(|(_, d)| *d < 8.0)
+                                                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                                                        .map(|(id, _)| id)
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some(b) = bone_hit {
+                                                    selected_bone = Some(b);
+                                                } else {
+                                                    if let Some(hit) = part_at(&character, &hidden_layers, &locked_layers, screen_to_world(origin)) {
+                                                        selected_layer = Some(hit);
+                                                    }
+                                                    let mut bone = selected_layer.as_ref().and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone());
+                                                    // Уже выбран предок этой кости (например, вся голова
+                                                    // через Alt) — остаёмся на нём: тащить голову можно
+                                                    // за любой её элемент, как группу в Animate.
+                                                    let mut ancestor = bone.as_ref().and_then(|b| character.skeleton.find(b)).and_then(|b| b.parent.clone());
+                                                    let mut guard = 0;
+                                                    while let Some(a) = ancestor.clone() {
+                                                        if selected_bone.as_deref() == Some(a.as_str()) && character.skeleton.find(&a).is_some_and(|b| b.parent.is_some()) {
+                                                            bone = Some(a);
+                                                            break;
+                                                        }
+                                                        ancestor = character.skeleton.find(&a).and_then(|b| b.parent.clone());
+                                                        guard += 1;
+                                                        if guard > 256 {
+                                                            break;
+                                                        }
+                                                    }
+                                                    if alt {
+                                                        if let Some(parent) = bone.as_ref().and_then(|b| character.skeleton.find(b)).and_then(|b| b.parent.clone()) {
+                                                            if character.skeleton.find(&parent).is_some_and(|p| p.parent.is_some()) {
+                                                                bone = Some(parent);
+                                                            }
+                                                        }
+                                                    }
+                                                    if bone.is_some() {
+                                                        selected_bone = bone;
+                                                    }
+                                                }
+                                                if let Some(b) = &selected_bone {
+                                                    status_message = format!("Xform: кость '{b}' (тащить — двигать, Shift — вращать, Alt+клик — кость-родитель)");
+                                                }
+                                            }
+                                        }
+                                        let layer_locked = selected_layer.as_ref().is_some_and(|id| locked_layers.contains(id));
+                                        if response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.shift) && !layer_locked {
+                                            // Shift — поворот вокруг точки кости (в Animate — угол
+                                            // Free Transform). Угол между прошлой и текущей позицией
+                                            // курсора относительно кости, в мировых координатах.
+                                            if let (Some(bone_id), Some(pos)) = (selected_bone.clone(), response.interact_pointer_pos()) {
+                                                if let Some(center) = character.skeleton.world_transform_with_ik(&bone_id).map(|w| w.position) {
+                                                    let prev = screen_to_world(pos - response.drag_delta()) - center;
+                                                    let cur = screen_to_world(pos) - center;
+                                                    if prev.length() > 1e-3 && cur.length() > 1e-3 {
+                                                        let mut da = cur.y.atan2(cur.x) - prev.y.atan2(prev.x);
+                                                        if da > std::f32::consts::PI {
+                                                            da -= std::f32::consts::TAU;
+                                                        } else if da < -std::f32::consts::PI {
+                                                            da += std::f32::consts::TAU;
+                                                        }
+                                                        if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
+                                                            bone.local_transform.rotation += da;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if response.dragged_by(egui::PointerButton::Primary) && !layer_locked {
+                                            if let Some(bone_id) = selected_bone.clone().filter(|b| character.skeleton.find(b).is_some()) {
                                                 let delta_screen = response.drag_delta();
                                                 let delta_frame = glam::Vec2::new(delta_screen.x, -delta_screen.y) / stage_zoom;
                                                 let delta_after_cam = delta_frame * inv_zoom;
@@ -3464,9 +4335,20 @@ fn main() {
                                                     delta_after_cam.x * cos_r - delta_after_cam.y * sin_r,
                                                     delta_after_cam.x * sin_r + delta_after_cam.y * cos_r,
                                                 );
+                                                // Локальная позиция кости — в пространстве РОДИТЕЛЯ:
+                                                // сдвиг в мире переводим через мировую трансформацию
+                                                // родителя (раньше мировой сдвиг прибавлялся напрямую, и
+                                                // кость повёрнутого/отмасштабированного родителя уезжала
+                                                // не туда, куда тянули).
+                                                let parent_world = character.skeleton.find(&bone_id).and_then(|b| b.parent.clone()).and_then(|p| character.skeleton.world_transform_with_ik(&p));
+                                                let bone_world = character.skeleton.world_transform_with_ik(&bone_id);
                                                 if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
-                                                    bone.local_transform.position.x += delta_world.x;
-                                                    bone.local_transform.position.y += delta_world.y;
+                                                    match (parent_world, bone_world) {
+                                                        (Some(parent_world), Some(bone_world)) => {
+                                                            bone.local_transform.position = pony_render::pivot_for_world_position(bone_world.position + delta_world, &parent_world);
+                                                        }
+                                                        _ => bone.local_transform.position += delta_world,
+                                                    }
                                                 }
                                             }
                                         }
@@ -3474,11 +4356,14 @@ fn main() {
 
                                     if active_tool == Tool::Eyedropper && response.clicked() {
                                         if let (Some(screen_pos), Some(frame)) = (response.interact_pointer_pos(), &last_frame_output) {
-                                            let fx = ((screen_pos.x - stage_rect.left()) / stage_zoom).round() as i32;
-                                            let fy = ((screen_pos.y - stage_rect.top()) / stage_zoom).round() as i32;
+                                            // Пиксель кадра под курсором: кадр покрывает
+                                            // `scene_image_rect` в разрешении экрана.
+                                            let fx = ((screen_pos.x - scene_image_rect.left()) * ppp).floor() as i32;
+                                            let fy = ((screen_pos.y - scene_image_rect.top()) * ppp).floor() as i32;
                                             if fx >= 0 && fy >= 0 && (fx as u32) < frame.width && (fy as u32) < frame.height {
                                                 let idx = ((fy as u32 * frame.width + fx as u32) * 4) as usize;
                                                 fill_color = egui::Color32::from_rgba_unmultiplied(frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2], frame.rgba[idx + 3]);
+                                                status_message = format!("Пипетка: Fill = #{:02x}{:02x}{:02x}", frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2]);
                                             }
                                         }
                                     }
@@ -3488,10 +4373,9 @@ fn main() {
                                         if let Some(screen_pos) = response.interact_pointer_pos() {
                                             let target = screen_to_world(screen_pos);
                                             let parent_id = selected_bone.clone().unwrap_or_else(|| "Root".to_string());
-                                            if let Some(parent_world) = character.skeleton.world_transform(&parent_id) {
-                                                push_undo(&mut undo_stack, &mut redo_stack, &character);
+                                            if let Some(parent_world) = character.skeleton.world_transform_with_ik(&parent_id) {
                                                 bone_count += 1;
-                                                let new_id = format!("Bone_{bone_count}");
+                                                let new_id = unique_name(&format!("Bone_{bone_count}"), |c| character.skeleton.find(c).is_some());
                                                 // Та же математика, что и у частей (compose() в Skeleton
                                                 // устроен идентично part_world_position) — клик даёт мировую
                                                 // точку, а хранить нужно смещение относительно родителя.
@@ -3539,7 +4423,7 @@ fn main() {
                                             let close_enough_to_start = pen_points.first().map(|(sx, sy)| {
                                                 let dx = sx - svg_pt.0;
                                                 let dy = sy - svg_pt.1;
-                                                (dx * dx + dy * dy).sqrt() < 10.0 / stage_zoom
+                                                (dx * dx + dy * dy).sqrt() < 10.0 / (stage_zoom * camera.zoom.max(0.0001))
                                             });
                                             if close_enough_to_start == Some(true) && pen_points.len() >= 3 {
                                                 vector_doc.add(pony_core::VectorShape::Polygon {
@@ -3560,7 +4444,7 @@ fn main() {
                                     if pen_points.len() >= 1 {
                                         let screen_pts: Vec<egui::Pos2> = pen_points.iter().map(|(x, y)| world_to_screen(glam::Vec2::new(*x, -*y))).collect();
                                         if screen_pts.len() >= 2 {
-                                            painter.add(egui::Shape::line(screen_pts.clone(), egui::Stroke::new(1.5, stroke_color)));
+                                            painter.add(egui::Shape::line(screen_pts.clone(), egui::Stroke::new(1.5_f32, stroke_color)));
                                         }
                                         for p in &screen_pts {
                                             painter.circle_filled(*p, 3.0, egui::Color32::from_rgb(120, 200, 255));
@@ -3571,16 +4455,16 @@ fn main() {
                                     // сохранённую) фигуру на холсте, дальше её "узлы"
                                     // (control points) можно тащить, меняя саму форму.
                                     if active_tool == Tool::SubSelection {
-                                        if response.drag_started() {
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
                                             // Сначала проверяем, не начали ли тащить УЖЕ
                                             // выбранный узел (приоритет над выбором новой
                                             // фигуры — иначе перетаскивание узла около края
                                             // другой фигуры перевыбирало бы фигуру вместо
                                             // редактирования точки).
                                             dragging_point_index = None;
-                                            if let (Some(shape_idx), Some(pos)) = (selected_shape_index, response.interact_pointer_pos()) {
+                                            if let (Some(shape_idx), Some(pos)) = (selected_shape_index, press_origin) {
                                                 if let Some(shape) = vector_doc.shapes.get(shape_idx) {
-                                                    let handle_radius_world = 8.0 / stage_zoom;
+                                                    let handle_radius_world = 8.0 / (stage_zoom * camera.zoom.max(0.0001));
                                                     for (i, (px, py)) in shape.control_points().iter().enumerate() {
                                                         let handle_world = screen_to_world(pos);
                                                         let dx = px - handle_world.x;
@@ -3593,7 +4477,7 @@ fn main() {
                                                 }
                                             }
                                         }
-                                        if response.dragged() {
+                                        if response.dragged_by(egui::PointerButton::Primary) {
                                             if let (Some(shape_idx), Some(point_idx), Some(pos)) = (selected_shape_index, dragging_point_index, response.interact_pointer_pos()) {
                                                 let w = screen_to_world(pos);
                                                 if let Some(shape) = vector_doc.shapes.get_mut(shape_idx) {
@@ -3601,7 +4485,7 @@ fn main() {
                                                 }
                                             }
                                         }
-                                        if response.drag_stopped() {
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) {
                                             dragging_point_index = None;
                                         }
                                         if response.clicked() && dragging_point_index.is_none() {
@@ -3617,7 +4501,7 @@ fn main() {
                                                 for (px, py) in shape.control_points() {
                                                     let p = world_to_screen(glam::Vec2::new(px, -py));
                                                     painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(7.0, 7.0)), 1.0, egui::Color32::WHITE);
-                                                    painter.rect_stroke(egui::Rect::from_center_size(p, egui::vec2(7.0, 7.0)), 1.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 140, 220)));
+                                                    painter.rect_stroke(egui::Rect::from_center_size(p, egui::vec2(7.0, 7.0)), 1.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 140, 220)));
                                                 }
                                             }
                                         }
@@ -3627,20 +4511,20 @@ fn main() {
                                     // персонажа (по их мировой позиции — та же формула,
                                     // что и у остальных hit-тестов в этом файле) ---
                                     if active_tool == Tool::Lasso {
-                                        if response.drag_started() {
-                                            lasso_start = response.interact_pointer_pos().map(screen_to_world);
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
+                                            lasso_start = press_origin.map(screen_to_world);
                                         }
-                                        if response.dragged() {
+                                        if response.dragged_by(egui::PointerButton::Primary) {
                                             if let (Some(start), Some(cur_screen)) = (lasso_start, response.interact_pointer_pos()) {
                                                 let start_screen = world_to_screen(start);
                                                 painter.rect_stroke(
                                                     egui::Rect::from_two_pos(start_screen, cur_screen),
                                                     0.0,
-                                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 230, 140)),
+                                                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 230, 140)),
                                                 );
                                             }
                                         }
-                                        if response.drag_stopped() {
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) {
                                             if let (Some(start), Some(end_screen)) = (lasso_start.take(), response.interact_pointer_pos()) {
                                                 let end = screen_to_world(end_screen);
                                                 let (min_x, max_x) = (start.x.min(end.x), start.x.max(end.x));
@@ -3648,7 +4532,7 @@ fn main() {
                                                 multi_selected.clear();
                                                 for (id, part) in &character.parts {
                                                     let Some(bone_id) = &part.bone else { continue };
-                                                    let Some(world) = character.skeleton.world_transform(bone_id) else { continue };
+                                                    let Some(world) = character.skeleton.world_transform_with_ik(bone_id) else { continue };
                                                     let pos = pony_render::part_world_position(part, &world);
                                                     if pos.x >= min_x && pos.x <= max_x && pos.y >= min_y && pos.y <= max_y {
                                                         multi_selected.insert(id.clone());
@@ -3662,14 +4546,14 @@ fn main() {
                                     // с обычным (синим) выделением одной части.
                                     for id in &multi_selected {
                                         if let Some(part) = character.parts.get(id) {
-                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)) {
+                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                 let pos = pony_render::part_world_position(part, &world);
                                                 let size = pony_render::part_render_size(part);
                                                 let half_w = size.x * world.scale.x.abs() / 2.0;
                                                 let half_h = size.y * world.scale.y.abs() / 2.0;
                                                 let p0 = world_to_screen(glam::Vec2::new(pos.x - half_w, pos.y - half_h));
                                                 let p1 = world_to_screen(glam::Vec2::new(pos.x + half_w, pos.y + half_h));
-                                                painter.rect_stroke(egui::Rect::from_two_pos(p0, p1), 0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 230, 140)));
+                                                painter.rect_stroke(egui::Rect::from_two_pos(p0, p1), 0.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 230, 140)));
                                             }
                                         }
                                     }
@@ -3677,23 +4561,31 @@ fn main() {
                                     // --- рисование фигур (раздел 16 ТЗ: SVG теперь не только импорт) ---
                                     let is_shape_tool = matches!(active_tool, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::PolyStar);
                                     if is_shape_tool {
-                                        if response.drag_started() {
-                                            draw_start = response.interact_pointer_pos().map(screen_to_world);
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
+                                            draw_start = press_origin.map(screen_to_world);
                                         }
-                                        if response.dragged() {
+                                        if response.dragged_by(egui::PointerButton::Primary) {
                                             // Живое превью — рисуем прямо в экранных координатах поверх
                                             // сцены, ничего пока не коммитим в vector_doc.
                                             if let (Some(start_world), Some(cur_screen)) = (draw_start, response.interact_pointer_pos()) {
                                                 let start_screen = world_to_screen(start_world);
-                                                let preview_stroke = egui::Stroke::new(1.5, stroke_color);
+                                                let preview_stroke = egui::Stroke::new(1.5_f32, stroke_color);
                                                 match active_tool {
                                                     Tool::Rectangle => {
                                                         painter.rect_stroke(egui::Rect::from_two_pos(start_screen, cur_screen), 0.0, preview_stroke);
                                                     }
                                                     Tool::Oval => {
+                                                        // Эллипс, а не круг по большей стороне — превью
+                                                        // должно совпадать с тем, что будет создано.
                                                         let center = start_screen.lerp(cur_screen, 0.5);
-                                                        let r = ((cur_screen.x - start_screen.x).abs() / 2.0).max((cur_screen.y - start_screen.y).abs() / 2.0);
-                                                        painter.circle_stroke(center, r, preview_stroke);
+                                                        let (rx, ry) = ((cur_screen.x - start_screen.x).abs() / 2.0, (cur_screen.y - start_screen.y).abs() / 2.0);
+                                                        let pts: Vec<egui::Pos2> = (0..48)
+                                                            .map(|i| {
+                                                                let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                                                                center + egui::vec2(a.cos() * rx, a.sin() * ry)
+                                                            })
+                                                            .collect();
+                                                        painter.add(egui::Shape::closed_line(pts, preview_stroke));
                                                     }
                                                     Tool::Line => {
                                                         painter.line_segment([start_screen, cur_screen], preview_stroke);
@@ -3714,7 +4606,7 @@ fn main() {
                                                 }
                                             }
                                         }
-                                        if response.drag_stopped() {
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) {
                                             if let (Some(start_world), Some(end_screen)) = (draw_start.take(), response.interact_pointer_pos()) {
                                                 let end_world = screen_to_world(end_screen);
                                                 let fill = color32_to_rgba(fill_color);
@@ -3787,13 +4679,23 @@ fn main() {
                                     }
 
                                     if matches!(active_tool, Tool::Pencil | Tool::Brush) {
-                                        if response.dragged() {
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
+                                            pencil_points.clear();
+                                            if let Some(origin) = press_origin {
+                                                let w = screen_to_world(origin);
+                                                pencil_points.push((w.x, -w.y));
+                                            }
+                                        }
+                                        if response.dragged_by(egui::PointerButton::Primary) {
                                             if let Some(pos) = response.interact_pointer_pos() {
                                                 let w = screen_to_world(pos);
                                                 pencil_points.push((w.x, -w.y));
                                             }
                                         }
-                                        if response.drag_stopped() && pencil_points.len() >= 2 {
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) && pencil_points.len() < 2 {
+                                            pencil_points.clear();
+                                        }
+                                        if response.drag_stopped_by(egui::PointerButton::Primary) && pencil_points.len() >= 2 {
                                             vector_doc.add(pony_core::VectorShape::Polyline {
                                                 points: std::mem::take(&mut pencil_points),
                                                 stroke: color32_to_rgba(stroke_color),
@@ -3804,16 +4706,9 @@ fn main() {
                                         if pencil_points.len() >= 2 {
                                             let screen_pts: Vec<egui::Pos2> =
                                                 pencil_points.iter().map(|(x, y)| world_to_screen(glam::Vec2::new(*x, -*y))).collect();
-                                            painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(2.0, stroke_color)));
+                                            painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(2.0_f32, stroke_color)));
                                         }
                                     }
-
-                                    // Для СЛЕДУЮЩЕГО кадра: был ли этот кадр перетаскиванием
-                                    // фигуры рисования — от этого зависит, пропустит ли
-                                    // следующий кадр дорогой рендер персонажа (см. объявление
-                                    // `was_dragging_shape_last_frame` в начале функции).
-                                    was_dragging_shape_last_frame =
-                                        response.dragged() && matches!(active_tool, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Pencil | Tool::Brush);
 
                                     // Уже нарисованные фигуры — поверх сцены, в тех же экранных
                                     // координатах, что и всё остальное на Stage. Symbol Instance
@@ -3838,25 +4733,25 @@ fn main() {
                                     // управлять: непонятно, где они, что чей родитель, что выбрано.
                                     if show_skeleton {
                                         for bone in &character.skeleton.bones {
-                                            let Some(world) = character.skeleton.world_transform(&bone.id) else { continue };
+                                            let Some(world) = character.skeleton.world_transform_with_ik(&bone.id) else { continue };
                                             let p = world_to_screen(glam::Vec2::new(world.position.x, world.position.y));
                                             let is_sel = selected_bone.as_deref() == Some(bone.id.as_str());
                                             let color = if is_sel { egui::Color32::from_rgb(255, 210, 60) } else { egui::Color32::from_rgb(120, 190, 255) };
                                             if let Some(parent_id) = &bone.parent {
-                                                if let Some(parent_world) = character.skeleton.world_transform(parent_id) {
+                                                if let Some(parent_world) = character.skeleton.world_transform_with_ik(parent_id) {
                                                     let pp = world_to_screen(glam::Vec2::new(parent_world.position.x, parent_world.position.y));
-                                                    painter.line_segment([pp, p], egui::Stroke::new(1.5, color.gamma_multiply(0.7)));
+                                                    painter.line_segment([pp, p], egui::Stroke::new(1.5_f32, color.gamma_multiply(0.7)));
                                                 }
                                             }
                                             painter.circle_filled(p, if is_sel { 5.0 } else { 3.5 }, color);
                                             if is_sel {
-                                                painter.circle_stroke(p, 8.0, egui::Stroke::new(1.5, color));
+                                                painter.circle_stroke(p, 8.0, egui::Stroke::new(1.5_f32, color));
                                             }
                                         }
                                     }
                                     if placing_bone {
                                         if let Some(hover) = response.hover_pos() {
-                                            painter.circle_stroke(hover, 6.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 60)));
+                                            painter.circle_stroke(hover, 6.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 210, 60)));
                                         }
                                     }
 
@@ -3864,9 +4759,9 @@ fn main() {
                                     // сейчас двигаешь и попал ли клик туда, куда целился.
                                     if let Some(sel_id) = &selected_layer {
                                         if let Some(part) = character.parts.get(sel_id) {
-                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform(b)) {
+                                            if let Some(world) = part.bone.as_ref().and_then(|b| character.skeleton.world_transform_with_ik(b)) {
                                                 let part_pos = pony_render::part_world_position(part, &world);
-                                                let depth_z = -(part.layer as f32) * pony_render::DEPTH_PER_LAYER;
+                                                let depth_z = pony_render::part_depth(&character, part);
                                                 let (yawed_x, foreshorten) = pony_core::apply_yaw_2_5d(part_pos.x, depth_z, character.facing_yaw);
                                                 let size = pony_render::part_render_size(part);
                                                 let half_w = size.x * world.scale.x.abs() * foreshorten / 2.0;
@@ -3874,31 +4769,31 @@ fn main() {
                                                 let p0 = world_to_screen(glam::Vec2::new(yawed_x - half_w, part_pos.y - half_h));
                                                 let p1 = world_to_screen(glam::Vec2::new(yawed_x + half_w, part_pos.y + half_h));
                                                 let rect = egui::Rect::from_two_pos(p0, p1);
-                                                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 170, 255)));
+                                                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 170, 255)));
                                                 // Точка привязки к кости — видно, вокруг чего
                                                 // часть будет вращаться при повороте кости.
                                                 let bone_screen = world_to_screen(glam::Vec2::new(world.position.x, world.position.y));
-                                                painter.circle_stroke(bone_screen, 4.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 190, 90)));
-                                                painter.line_segment([bone_screen, rect.center()], egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 190, 90)));
+                                                painter.circle_stroke(bone_screen, 4.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 190, 90)));
+                                                painter.line_segment([bone_screen, rect.center()], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 190, 90)));
                                             }
                                         }
                                     }
 
-                                    painter.rect_stroke(stage_rect, 0.0, egui::Stroke::new(1.5, egui::Color32::from_gray(15)));
+                                    painter.rect_stroke(stage_rect, 0.0, egui::Stroke::new(1.5_f32, egui::Color32::from_gray(15)));
 
                                     painter.rect_filled(egui::Rect::from_min_max(avail.min, egui::pos2(avail.right(), avail.top() + ruler)), 0.0, egui::Color32::from_gray(50));
                                     painter.rect_filled(egui::Rect::from_min_max(avail.min, egui::pos2(avail.left() + ruler, avail.bottom())), 0.0, egui::Color32::from_gray(50));
                                     let mut rx = stage_rect.left();
                                     while rx < canvas_rect.right() {
                                         if rx >= canvas_rect.left() {
-                                            painter.line_segment([egui::pos2(rx, avail.top()), egui::pos2(rx, avail.top() + ruler)], egui::Stroke::new(1.0, egui::Color32::from_gray(110)));
+                                            painter.line_segment([egui::pos2(rx, avail.top()), egui::pos2(rx, avail.top() + ruler)], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)));
                                         }
                                         rx += 50.0 * stage_zoom;
                                     }
                                     let mut ry = stage_rect.top();
                                     while ry < canvas_rect.bottom() {
                                         if ry >= canvas_rect.top() {
-                                            painter.line_segment([egui::pos2(avail.left(), ry), egui::pos2(avail.left() + ruler, ry)], egui::Stroke::new(1.0, egui::Color32::from_gray(110)));
+                                            painter.line_segment([egui::pos2(avail.left(), ry), egui::pos2(avail.left() + ruler, ry)], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)));
                                         }
                                         ry += 50.0 * stage_zoom;
                                     }
@@ -3906,6 +4801,241 @@ fn main() {
                                     mouse_stage_pos = response.hover_pos().map(|p| egui::pos2((p.x - stage_rect.left()) / stage_zoom, (p.y - stage_rect.top()) / stage_zoom));
                                 });
                             });
+
+                            // --- загрузка документа Adobe Animate (окно импорта) ---
+                            if std::mem::take(&mut xfl_load_request) {
+                                let path = xfl_path.trim().to_string();
+                                let t = Instant::now();
+                                match pony_core::xfl::XflDocument::open(&path) {
+                                    Ok(doc) => {
+                                        xfl_info = format!(
+                                            "{}: {} символов, сцена {}×{}, {} fps — загружено за {:.1} с{}",
+                                            doc.name,
+                                            doc.symbols.len(),
+                                            doc.width,
+                                            doc.height,
+                                            doc.frame_rate,
+                                            t.elapsed().as_secs_f32(),
+                                            if doc.warnings.is_empty() { String::new() } else { format!(" (пропущено битых символов: {})", doc.warnings.len()) }
+                                        );
+                                        xfl_symbol = default_xfl_symbol(&doc);
+                                        xfl_frame = 0;
+                                        xfl_preview_key = None;
+                                        status_message = format!("Adobe Animate: открыт {path}");
+                                        xfl_doc = Some(doc);
+                                    }
+                                    Err(err) => {
+                                        xfl_info = format!("Не удалось открыть {path}: {err}");
+                                        status_message = xfl_info.clone();
+                                    }
+                                }
+                                xfl_window_open = true;
+                                needs_redraw = true;
+                            }
+
+                            // --- действия из меню/тулбара/горячих клавиш ---
+                            for action in actions.drain(..) {
+                                match action {
+                                    // File > Open с путём к .fla/.xfl или папке XFL — это
+                                    // документ Adobe Animate, а не .asset: открываем окно импорта.
+                                    Action::Open
+                                        if std::path::Path::new(asset_path.trim()).is_dir()
+                                            || std::path::Path::new(asset_path.trim())
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .is_some_and(|e| e.eq_ignore_ascii_case("fla") || e.eq_ignore_ascii_case("xfl")) =>
+                                    {
+                                        xfl_path = asset_path.trim().to_string();
+                                        xfl_load_request = true;
+                                    }
+                                    Action::ImportXfl => {
+                                        let Some(doc) = &xfl_doc else { continue };
+                                        let out_dir = xfl_import_dir(&doc.name, xfl_symbol.as_deref(), xfl_frame);
+                                        match pony_core::xfl::import_to_character(doc, xfl_symbol.as_deref(), xfl_frame, &xfl_opts, &out_dir) {
+                                            Ok((imported, report)) => {
+                                                // Новый персонаж сцены — текущий уходит в список
+                                                // остальных (как "+ Новый персонаж" на таймлайне).
+                                                new_character_count += 1;
+                                                let name = format!("{} {new_character_count}", imported.name);
+                                                other_characters.push(CharacterSlot {
+                                                    character: std::mem::replace(&mut character, imported),
+                                                    player: std::mem::replace(&mut player, AnimationPlayer::new()),
+                                                    name: std::mem::replace(&mut active_character_name, name),
+                                                });
+                                                // Перезаписанные SVG (повторный импорт того же кадра)
+                                                // не должны браться из кэша текстур.
+                                                for part in character.parts.values() {
+                                                    if let PartSource::Vector { path } = &part.source {
+                                                        pony_renderer.invalidate_texture(path);
+                                                    }
+                                                }
+                                                playing = false;
+                                                selected_layer = None;
+                                                selected_bone = None;
+                                                selected_keyframe = None;
+                                                multi_selected.clear();
+                                                hidden_layers.clear();
+                                                locked_layers.clear();
+                                                show_skeleton = false;
+                                                history.reset(&character, &vector_doc);
+                                                fit_request = Some(FitView::Character);
+                                                xfl_window_open = false;
+                                                status_message = format!(
+                                                    "Импортировано: {} частей -> {}{}",
+                                                    report.parts,
+                                                    report.out_dir.display(),
+                                                    if report.unsupported > 0 { format!(" (пропущено текста/картинок: {})", report.unsupported) } else { String::new() }
+                                                );
+                                            }
+                                            Err(err) => status_message = format!("Импорт не удался: {err}"),
+                                        }
+                                    }
+                                    Action::New => {
+                                        character = build_walking_pony();
+                                        pick_default_animation(&character, &mut player);
+                                        player.apply(&mut character);
+                                        playing = false;
+                                        vector_doc.clear();
+                                        editing_part = None;
+                                        selected_layer = None;
+                                        selected_keyframe = None;
+                                        selected_shape_index = None;
+                                        multi_selected.clear();
+                                        hidden_layers.clear();
+                                        locked_layers.clear();
+                                        fit_request = Some(FitView::Character);
+                                        status_message = "Новый персонаж (Ctrl+Z — вернуть предыдущего)".into();
+                                    }
+                                    Action::Open => match Character::load_from_file(&asset_path) {
+                                        Ok(loaded) => {
+                                            character = loaded;
+                                            // Раньше после Open плеер оставался пустым: таймлайн
+                                            // показывал пустую сетку, и ключи было некуда ставить.
+                                            pick_default_animation(&character, &mut player);
+                                            player.apply(&mut character);
+                                            playing = false;
+                                            selected_layer = None;
+                                            selected_keyframe = None;
+                                            multi_selected.clear();
+                                            hidden_layers.clear();
+                                            locked_layers.clear();
+                                            history.reset(&character, &vector_doc);
+                                            saved_revision = history.revision;
+                                            fit_request = Some(FitView::Character);
+                                            status_message = format!("Загружено из {asset_path}");
+                                        }
+                                        Err(err) => status_message = format!("Ошибка загрузки {asset_path}: {err}"),
+                                    },
+                                    Action::Save => {
+                                        status_message = match character.save_to_file(&asset_path) {
+                                            Ok(()) => {
+                                                // Сохраняем то, что видно сейчас: незафиксированная
+                                                // правка (если есть) тоже должна считаться сохранённой.
+                                                history.commit_if_changed(&character, &vector_doc, &player);
+                                                saved_revision = history.revision;
+                                                format!("Сохранено в {asset_path}")
+                                            }
+                                            Err(err) => format!("Ошибка сохранения {asset_path}: {err}"),
+                                        };
+                                    }
+                                    Action::Undo | Action::Redo => {
+                                        let restored = if action == Action::Undo { history.undo(&character, &vector_doc) } else { history.redo(&character, &vector_doc) };
+                                        match restored {
+                                            Some(state) => {
+                                                character = state.character;
+                                                vector_doc = state.vector_doc;
+                                                // Ссылки на то, чего после отмены может уже не быть.
+                                                if selected_layer.as_ref().is_some_and(|id| !character.parts.contains_key(id)) {
+                                                    selected_layer = None;
+                                                }
+                                                if selected_bone.as_ref().is_some_and(|id| character.skeleton.find(id).is_none()) {
+                                                    selected_bone = None;
+                                                }
+                                                if selected_shape_index.is_some_and(|i| i >= vector_doc.shapes.len()) {
+                                                    selected_shape_index = None;
+                                                }
+                                                if !player.is_valid(&character) {
+                                                    pick_default_animation(&character, &mut player);
+                                                }
+                                                selected_keyframe = None;
+                                                status_message = if action == Action::Undo { "Отменено".into() } else { "Возвращено".into() };
+                                            }
+                                            None => status_message = if action == Action::Undo { "Нечего отменять".into() } else { "Нечего возвращать".into() },
+                                        }
+                                    }
+                                    Action::TogglePlay => {
+                                        if !playing && player.is_finished(&character) && player.is_valid(&character) {
+                                            // Доигравшая незацикленная анимация — Play начинает сначала.
+                                            player.seek(&character, 0.0);
+                                        }
+                                        playing = !playing && player.is_valid(&character);
+                                        if !player.is_valid(&character) {
+                                            status_message = "Нет анимации — создай её кнопкой «+» на таймлайне".into();
+                                        }
+                                    }
+                                    Action::Rewind | Action::GoToEnd | Action::PrevFrame | Action::NextFrame => {
+                                        playing = false;
+                                        let duration = player.current_name().and_then(|n| character.animations.get(n)).map(|a| a.duration).unwrap_or(0.0);
+                                        let frame = (player.time() * FPS).round();
+                                        let t = match action {
+                                            Action::Rewind => 0.0,
+                                            Action::GoToEnd => duration,
+                                            Action::PrevFrame => (frame - 1.0) / FPS,
+                                            _ => (frame + 1.0) / FPS,
+                                        };
+                                        player.seek(&character, t);
+                                        player.apply(&mut character);
+                                    }
+                                    Action::InsertKeyframe => {
+                                        // В Xform ключ ставится той кости, которую двигаешь
+                                        // (например, кости-контейнеру головы), иначе — кости слоя.
+                                        let bone = if active_tool == Tool::FreeTransform && selected_bone.as_ref().is_some_and(|b| character.skeleton.find(b).is_some()) {
+                                            selected_bone.clone()
+                                        } else {
+                                            selected_layer.as_ref().and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone())
+                                        };
+                                        match (selected_layer.clone(), bone) {
+                                            (Some(layer_id), Some(bone_id)) => {
+                                                let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, timeline_channel)).unwrap_or(0.0);
+                                                let anim_name = ensure_animation(&mut character, &mut player);
+                                                // Время — по сетке кадров: ключ "между кадрами"
+                                                // потом нельзя было ни выделить, ни удалить.
+                                                let frame = (player.time() * FPS).round();
+                                                if let Some(anim) = character.animations.get_mut(&anim_name) {
+                                                    insert_keyframe(anim, &bone_id, timeline_channel, frame / FPS, value);
+                                                    selected_keyframe = Some((layer_id, frame as i64));
+                                                    status_message = format!("Ключ на кадре {frame} для кости '{bone_id}' ({})", channel_label(timeline_channel));
+                                                }
+                                            }
+                                            (Some(_), None) => status_message = "У выбранного слоя нет кости — ключ ставить не к чему".into(),
+                                            (None, _) => status_message = "Сначала выбери слой (на Stage или в Timeline)".into(),
+                                        }
+                                    }
+                                    Action::ExportGif | Action::ExportSpritesheet => {
+                                        // Экспортируется то, что видно: скрытые в редакторе слои
+                                        // и группы раньше всё равно попадали в GIF/спрайт-лист.
+                                        let mut visible = character.clone();
+                                        visible.parts.retain(|id, _| !hidden_layers.contains(id) && !character.is_part_hidden_by_group(id));
+                                        status_message = if action == Action::ExportGif {
+                                            export_animation_gif(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
+                                        } else {
+                                            export_animation_spritesheet(&mut pony_renderer, &gpu_ctx, &visible, player.current_name(), &camera, &lighting)
+                                        };
+                                    }
+                                }
+                                needs_redraw = true;
+                            }
+
+                            // --- история правок: фиксируем, когда жест мыши закончен ---
+                            if !egui_ctx.input(|i| i.pointer.any_down()) && history.commit_if_changed(&character, &vector_doc, &player) {
+                                needs_redraw = true;
+                            }
+                            let dirty = history.revision != saved_revision;
+                            let title = format!("pony-engine — {active_character_name} — {asset_path}{}", if dirty { " *" } else { "" });
+                            if title != window_title {
+                                window.set_title(&title);
+                                window_title = title;
+                            }
 
                             egui_state.handle_platform_output(&window, full_output.platform_output);
                             let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -3954,12 +5084,29 @@ fn main() {
 
                             gpu_ctx.queue.submit(Some(encoder.finish()));
                             surface_texture.present();
-                            window.request_redraw();
+
+                            // Перерисовываемся снова, только если есть зачем: идёт
+                            // анимация/частицы/тряска, egui просит (ховер, анимация
+                            // виджетов), документ ещё не догнал последний рендер или
+                            // только что было действие. Иначе цикл спит до следующего
+                            // события — раньше окно молотило CPU/GPU на 100% всегда.
+                            let egui_repaint = full_output.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
+                            let render_stale = !last_render_key.as_ref().is_some_and(|k| k.character == character && k.hidden == hidden_layers && k.lighting == lighting);
+                            let busy = playing || particles_enabled || camera.shake_intensity > 0.0 || blink_timer > 0.0 || render_stale || needs_redraw || autoexit_at.is_some();
+                            needs_redraw = false;
+                            match egui_repaint {
+                                _ if busy => window.request_redraw(),
+                                Some(delay) if delay.is_zero() => window.request_redraw(),
+                                Some(delay) if delay < Duration::from_secs(10) => elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + delay)),
+                                _ => elwt.set_control_flow(winit::event_loop::ControlFlow::Wait),
+                            }
                         }
                         _ => {}
                     }
                 }
-                Event::AboutToWait => window.request_redraw(),
+                // WaitUntil истёк (egui попросил перерисоваться с задержкой —
+                // например, мигание курсора в текстовом поле).
+                Event::NewEvents(winit::event::StartCause::ResumeTimeReached { .. }) => window.request_redraw(),
                 _ => {}
             }
         })
@@ -4018,6 +5165,97 @@ mod timeline_tests {
         assert_eq!(anim.duration, 1.0);
         insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 2.5, 0.0);
         assert!((anim.duration - 2.5).abs() < 1e-4, "длительность анимации должна вырасти под новый ключ");
+    }
+
+    #[test]
+    fn remove_keyframe_finds_key_placed_between_frames() {
+        // Ключ не ровно на границе кадра (0.43с ~ кадр 10.3) рисуется в
+        // ячейке кадра 10 — и удаляться должен по клику на эту ячейку.
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.43, 3.0);
+        assert_eq!(remove_keyframe(&mut anim, "Head", BoneChannel::PositionY, 10.0 / FPS), Some(3.0));
+    }
+
+    #[test]
+    fn has_keyframe_at_only_sees_the_same_bone_and_channel() {
+        let mut anim = test_anim();
+        insert_keyframe(&mut anim, "Head", BoneChannel::PositionY, 0.5, 1.0);
+        assert!(has_keyframe_at(&anim, "Head", BoneChannel::PositionY, 0.5));
+        assert!(!has_keyframe_at(&anim, "Head", BoneChannel::Rotation, 0.5));
+        assert!(!has_keyframe_at(&anim, "Body", BoneChannel::PositionY, 0.5));
+        assert!(!has_keyframe_at(&anim, "Head", BoneChannel::PositionY, 0.75));
+    }
+
+    #[test]
+    fn ensure_animation_creates_one_when_player_has_nothing() {
+        let mut character = Character::new("Empty");
+        let mut player = AnimationPlayer::new();
+        let name = ensure_animation(&mut character, &mut player);
+        assert!(character.animations.contains_key(&name));
+        assert_eq!(player.current_name(), Some(name.as_str()));
+        // Повторный вызов не плодит новые анимации.
+        assert_eq!(ensure_animation(&mut character, &mut player), name);
+        assert_eq!(character.animations.len(), 1);
+    }
+
+    #[test]
+    fn history_records_edits_but_not_animation_pose() {
+        let mut character = build_walking_pony();
+        let doc = pony_core::VectorDoc::new();
+        let mut player = AnimationPlayer::new();
+        player.play("Walk");
+        let mut history = History::new(&character, &doc);
+
+        // Воспроизведение двигает голову — это не правка.
+        player.advance(&character, 0.3);
+        player.apply(&mut character);
+        assert!(!history.commit_if_changed(&character, &doc, &player));
+        assert!(history.undo.is_empty());
+
+        // Правка пользователя — шаг истории.
+        character.parts.get_mut("horn").unwrap().pivot.x += 5.0;
+        assert!(history.commit_if_changed(&character, &doc, &player));
+        assert_eq!(history.undo.len(), 1);
+
+        // Undo возвращает старое значение, Redo — новое.
+        let before = history.undo(&character, &doc).unwrap();
+        let moved_x = character.parts["horn"].pivot.x;
+        assert!((before.character.parts["horn"].pivot.x - (moved_x - 5.0)).abs() < 1e-4);
+        let after = history.redo(&before.character, &before.vector_doc).unwrap();
+        assert!((after.character.parts["horn"].pivot.x - moved_x).abs() < 1e-4);
+    }
+
+    #[test]
+    fn history_records_vector_doc_drawing() {
+        let character = build_walking_pony();
+        let mut doc = pony_core::VectorDoc::new();
+        let player = AnimationPlayer::new();
+        let mut history = History::new(&character, &doc);
+        doc.add(pony_core::VectorShape::Line { x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0, stroke: pony_core::RgbaColor::new(0, 0, 0, 255), stroke_width: 1.0 });
+        assert!(history.commit_if_changed(&character, &doc, &player));
+        let prev = history.undo(&character, &doc).unwrap();
+        assert!(prev.vector_doc.shapes.is_empty(), "Undo должен убрать нарисованную фигуру");
+    }
+
+    #[test]
+    fn part_at_picks_topmost_visible_part() {
+        let character = build_walking_pony();
+        let none = HashSet::new();
+        let world = character.skeleton.world_transform_with_ik("Head").unwrap();
+        let head_pos = pony_render::part_world_position(&character.parts["head"], &world);
+        let hit = part_at(&character, &none, &none, head_pos).expect("в центре головы должна найтись часть");
+        assert!(character.parts[&hit].layer >= character.parts["head"].layer);
+        // Скрытая часть не выбирается.
+        let mut hidden = HashSet::new();
+        hidden.insert(hit.clone());
+        assert_ne!(part_at(&character, &hidden, &none, head_pos).as_deref(), Some(hit.as_str()));
+    }
+
+    #[test]
+    fn unique_name_skips_taken_names() {
+        let taken = ["drawn_1", "drawn_1_2"];
+        assert_eq!(unique_name("drawn_1", |c| taken.contains(&c)), "drawn_1_3");
+        assert_eq!(unique_name("drawn_5", |c| taken.contains(&c)), "drawn_5");
     }
 
     #[test]

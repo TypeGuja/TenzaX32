@@ -10,7 +10,7 @@
 
 use glam::Vec2;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct AmbientLight {
     pub color: [f32; 3],
     pub intensity: f32,
@@ -26,13 +26,13 @@ impl Default for AmbientLight {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct SunLight {
     pub color: [f32; 3],
     pub intensity: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct PointLight {
     pub position: Vec2,
     pub color: [f32; 3],
@@ -43,7 +43,7 @@ pub struct PointLight {
     pub radius: f32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Lighting {
     pub ambient: AmbientLight,
     pub sun: Option<SunLight>,

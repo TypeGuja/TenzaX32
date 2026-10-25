@@ -25,4 +25,7 @@ roxmltree.workspace = true
 # совместим с текущим потолком rustc/edition этого workspace (см.
 # комментарий у usvg в pony-render/Cargo.toml).
 i_overlay = "8.0"
-rand = "0.10.2"
+# Распаковка .fla (Adobe Animate): Animate пишет ZIP с битым central
+# directory, поэтому архив читается по локальным заголовкам вручную, а
+# deflate разжимается этим крейтом (уже есть в графе через png/flate2).
+miniz_oxide = "0.8"

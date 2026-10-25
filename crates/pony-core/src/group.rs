@@ -25,7 +25,7 @@ pub type GroupId = String;
 /// принадлежность идёт от ребёнка к родителю, не наоборот, см. `Part::group`
 /// и `PartGroup::parent`), чтобы не пришлось синхронизировать два списка
 /// (member ids здесь и `group` у `Part`) при каждой правке.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartGroup {
     pub id: GroupId,
     pub name: String,
@@ -63,7 +63,7 @@ impl PartGroup {
 /// reparent/remove/rename с защитой от циклов повторяли бы `Skeleton`
 /// почти дословно, так что вынесены в собственный тип с той же формой
 /// API, что и у `Skeleton` — тот же паттерн, знакомый по костям).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GroupTree {
     pub groups: Vec<PartGroup>,
 }

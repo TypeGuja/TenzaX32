@@ -476,6 +476,7 @@ mod tests {
             PathNode::corner((10.0, 10.0)),
         ];
         let open = VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes: nodes.clone(),
             closed: false,
             fill: RgbaColor::new(0, 0, 0, 255),
@@ -486,6 +487,8 @@ mod tests {
         assert!(flatten_shape_to_contour(&open).is_none());
 
         let closed = VectorShape::Path {
+
+            extra_contours: Vec::new(),
             nodes,
             closed: true,
             fill: RgbaColor::new(0, 0, 0, 255),
@@ -506,6 +509,7 @@ mod tests {
             PathNode::symmetric((10.0, 0.0), (1.0, 0.0), 3.0),
         ];
         let closed = VectorShape::Path {
+            extra_contours: Vec::new(),
             nodes,
             closed: true,
             fill: RgbaColor::new(0, 0, 0, 255),

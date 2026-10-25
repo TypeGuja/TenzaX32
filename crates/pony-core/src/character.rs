@@ -12,21 +12,21 @@ use crate::morph::MorphState;
 use crate::part::Part;
 use crate::skeleton::Skeleton;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Metadata {
     pub author: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PhysicsConfig {
     /// Кости, которые качаются пассивно (грива, хвост) — по имени кости
     /// и коэффициенту "мягкости" (0 = жёсткая, 1 = максимально свободная).
     pub soft_bones: HashMap<String, f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Character {
     pub name: String,
     pub version: String,
@@ -99,7 +99,14 @@ impl Character {
     /// Возвращает id новой группы. Части, которых нет в `self.parts`, тихо
     /// пропускаются (не паникует на устаревшую ссылку).
     pub fn group_parts(&mut self, name: impl Into<String>, part_ids: &[impl AsRef<str>]) -> crate::group::GroupId {
-        let group_id = format!("group_{}", self.groups.groups.len() + 1);
+        // Первый свободный номер, а не "число групп + 1": после Ungroup
+        // одной из групп "число + 1" совпадало с id уже существующей, и
+        // новая группа молча склеивалась со старой.
+        let mut n = self.groups.groups.len() + 1;
+        while self.groups.find(&format!("group_{n}")).is_some() {
+            n += 1;
+        }
+        let group_id = format!("group_{n}");
         self.groups.add(crate::group::PartGroup::new(group_id.clone(), name));
         for id in part_ids {
             if let Some(part) = self.parts.get_mut(id.as_ref()) {
@@ -178,13 +185,36 @@ impl Character {
 
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, AssetError> {
         let s = std::fs::read_to_string(path)?;
-        let character: Character = ron::from_str(&s)?;
+        let mut character: Character = ron::from_str(&s)?;
+        // `Track::sample` рассчитывает на ключи по возрастанию времени;
+        // в файле, поправленном руками или другим инструментом, порядок
+        // может быть любым — без сортировки анимация прыгала.
+        for anim in character.animations.values_mut() {
+            for track in &mut anim.tracks {
+                track.keyframes.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
         Ok(character)
     }
 }
 
 #[cfg(test)]
 mod group_tests {
+    #[test]
+    fn group_ids_stay_unique_after_ungroup() {
+        let mut c = Character::new("test");
+        for id in ["a", "b", "c"] {
+            c.add_part(png_part(id));
+        }
+        let g1 = c.group_parts("G1", &["a"]);
+        let g2 = c.group_parts("G2", &["b"]);
+        c.ungroup(&g1);
+        let g3 = c.group_parts("G3", &["c"]);
+        assert_ne!(g3, g2, "новая группа не должна получить id существующей");
+        assert_eq!(c.parts["b"].group.as_deref(), Some(g2.as_str()));
+        assert_eq!(c.groups.groups.iter().filter(|g| g.id == g3).count(), 1);
+    }
+
     use super::*;
     use crate::part::{PartKind, PartSource};
 

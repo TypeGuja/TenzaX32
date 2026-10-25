@@ -9,7 +9,7 @@ use std::collections::HashMap;
 pub type MorphName = String;
 
 /// Непрерывные параметры глаз, которых нет смысла делать булевыми выражениями.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
 pub struct EyeParams {
     pub radius: f32,
     pub height: f32,
@@ -30,7 +30,7 @@ impl Default for EyeParams {
 
 /// Текущее состояние морфинга персонажа: вес каждого именованного
 /// выражения (0..1, смешиваются) + параметры глаз.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MorphState {
     pub weights: HashMap<MorphName, f32>,
     pub eyes: EyeParams,

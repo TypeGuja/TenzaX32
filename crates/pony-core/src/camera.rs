@@ -8,7 +8,7 @@
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
 pub struct Camera {
     pub position: Vec2,
     pub rotation: f32,

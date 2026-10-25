@@ -81,6 +81,16 @@ impl AnimationPlayer {
         }
     }
 
+    /// Перейти на абсолютное время `t` (скраб плейхеда в редакторе).
+    /// В отличие от `advance`, НЕ оборачивает по модулю: `t == duration`
+    /// у зацикленной анимации — это последний кадр, а не первый.
+    pub fn seek(&mut self, character: &Character, t: f32) {
+        let Some(anim) = self.current.as_ref().and_then(|name| character.animations.get(name)) else {
+            return;
+        };
+        self.time = t.clamp(0.0, anim.duration.max(0.0));
+    }
+
     /// Применить текущий кадр к скелету/морфам персонажа. Дорожки на
     /// камеру (`AnimTarget::Camera`) здесь пропускаются — камера не часть
     /// `Character`, её должен обновлять вызывающий код отдельно (см.
@@ -168,6 +178,19 @@ mod tests {
         player.play("Bob");
         player.advance(&character, 2.5); // длительность 2.0 -> должно обернуться на 0.5
         assert!((player.time() - 0.5).abs() < 1e-4, "got {}", player.time());
+    }
+
+    #[test]
+    fn seek_to_end_of_looping_animation_does_not_wrap_to_start() {
+        let character = character_with_bob_animation(true);
+        let mut player = AnimationPlayer::new();
+        player.play("Bob");
+        player.seek(&character, 2.0);
+        assert!((player.time() - 2.0).abs() < 1e-4, "seek на конец не должен оборачиваться в 0, got {}", player.time());
+        player.seek(&character, 99.0);
+        assert!((player.time() - 2.0).abs() < 1e-4, "seek за конец зажимается на длительности");
+        player.seek(&character, -1.0);
+        assert_eq!(player.time(), 0.0);
     }
 
     #[test]

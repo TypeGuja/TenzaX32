@@ -37,7 +37,7 @@ use crate::skeleton::BoneId;
 /// решений для угла колена математически два (стандартная неоднозначность
 /// two-bone IK: колено может согнуться вперёд или назад и всё равно
 /// дотянуться до цели).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IkConstraint {
     pub id: String,
     pub root: BoneId,

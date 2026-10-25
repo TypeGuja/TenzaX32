@@ -206,3 +206,19 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::*;
+
+    #[test]
+    fn integer_arguments_are_accepted_like_floats() {
+        let commands = ScriptEngine::new().run("pony.Move(5, 0); camera.Zoom(2); pony.Smile(1);").expect("целые числа должны работать");
+        assert_eq!(commands, vec![Command::Move { dx: 5.0, dy: 0.0 }, Command::CameraZoom { factor: 2.0 }, Command::Smile { amount: 1.0 }]);
+    }
+
+    #[test]
+    fn infinite_loop_is_stopped_with_an_error_instead_of_hanging() {
+        assert!(ScriptEngine::new().run("loop { }").is_err());
+    }
+}
