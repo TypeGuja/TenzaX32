@@ -865,11 +865,12 @@ impl VectorShape {
                     d.push(' ');
                     d.push_str(&path_data_string(&c.nodes, c.closed));
                 }
-                let (fill_paint, fill_op) = if *closed {
-                    resolved_fill_paint(*fill, fill_gradient, known_gradients)
-                } else {
-                    ("none".to_string(), 0.0)
-                };
+                // Заливка пишется и у незамкнутого пути: по правилам SVG
+                // контур для заливки замыкается неявно. Раньше у таких путей
+                // (а без `Z` пишет все контуры Adobe Animate) заливка терялась,
+                // и сохранение отредактированной части стирало её цвета.
+                let _ = closed;
+                let (fill_paint, fill_op) = resolved_fill_paint(*fill, fill_gradient, known_gradients);
                 format!(
                     r#"<path d="{d}" fill="{fill_paint}" fill-opacity="{fill_op:.3}" stroke="{}" stroke-opacity="{:.3}" stroke-width="{stroke_width}" stroke-linecap="round" stroke-linejoin="round"/>"#,
                     stroke.to_hex(),
@@ -1530,6 +1531,13 @@ impl VectorDoc {
     /// символ через `resolve_symbol_instance`, в отличие от
     /// `VectorShape::bounds()`, у которого нет доступа к `self` (документу)
     /// — здесь он есть, так что нет причин мириться с приближением.
+    /// viewBox, который запишет `to_svg_string` (габарит с отступом 4):
+    /// (x, y, ширина, высота).
+    pub fn view_box(&self) -> (f32, f32, f32, f32) {
+        let (min_x, min_y, max_x, max_y) = self.bounds_with_padding(4.0);
+        (min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0))
+    }
+
     fn bounds_with_padding(&self, padding: f32) -> (f32, f32, f32, f32) {
         if self.shapes.is_empty() {
             return (0.0, 0.0, 1.0, 1.0);
@@ -2062,6 +2070,61 @@ fn extract_gradient_ref(raw: &str) -> Option<String> {
     inner.strip_prefix("gradient_").map(decode_svg_id)
 }
 
+/// `fill-rule="evenodd"` на элементе или его предках (атрибутом или в style).
+fn fill_rule_is_evenodd(node: roxmltree::Node) -> bool {
+    for n in node.ancestors().filter(|n| n.is_element()) {
+        if let Some(style) = n.attribute("style") {
+            for decl in style.split(';') {
+                if let Some((k, v)) = decl.split_once(':') {
+                    if k.trim() == "fill-rule" {
+                        return v.trim() == "evenodd";
+                    }
+                }
+            }
+        }
+        if let Some(v) = n.attribute("fill-rule") {
+            return v.trim() == "evenodd";
+        }
+    }
+    false
+}
+
+/// `VectorDoc` пишет пути с правилом заливки по умолчанию (nonzero). Чтобы
+/// путь с `evenodd` выглядел так же, контуры разворачиваются: на чётной
+/// глубине вложенности — в ту же сторону, что и внешний, на нечётной (дырки)
+/// — в обратную. Глубина — сколько других контуров содержат первую точку.
+fn normalize_evenodd_contours(contours: &mut [Contour]) {
+    if contours.len() < 2 {
+        return;
+    }
+    let polys: Vec<Vec<(f32, f32)>> = contours.iter().map(|c| c.nodes.iter().map(|n| n.position).collect()).collect();
+    let area = |p: &[(f32, f32)]| -> f32 { (0..p.len()).map(|i| { let (a, b) = (p[i], p[(i + 1) % p.len()]); a.0 * b.1 - b.0 * a.1 }).sum::<f32>() / 2.0 };
+    let inside = |pt: (f32, f32), poly: &[(f32, f32)]| -> bool {
+        let mut inside = false;
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    // Направление внешнего — у контура наибольшей площади.
+    let outer_sign = polys.iter().map(|p| area(p)).fold(0.0f32, |acc, a| if a.abs() > acc.abs() { a } else { acc }).signum();
+    for (i, contour) in contours.iter_mut().enumerate() {
+        let Some(&first) = polys[i].first() else { continue };
+        let depth = polys.iter().enumerate().filter(|(j, p)| *j != i && p.len() >= 3 && inside(first, p)).count();
+        let want = if depth % 2 == 0 { outer_sign } else { -outer_sign };
+        let a = area(&polys[i]);
+        if a != 0.0 && a.signum() != want {
+            contour.nodes.reverse();
+            for n in &mut contour.nodes {
+                std::mem::swap(&mut n.in_handle, &mut n.out_handle);
+            }
+        }
+    }
+}
+
 fn resolve_style(node: roxmltree::Node) -> ResolvedStyle {
     let mut fill_raw: Option<String> = node.attribute("fill").map(String::from);
     let mut stroke_raw: Option<String> = node.attribute("stroke").map(String::from);
@@ -2211,6 +2274,16 @@ fn collect_shapes(
             .unwrap_or(Transform2x3::IDENTITY);
         // Сначала собственный transform элемента, потом родительский.
         let combined = local_transform.then(transform);
+        // Обрезка и маски в модели VectorDoc не хранятся: фигуры читаются,
+        // но без обрезки — честно сообщаем, а не теряем молча.
+        for attr in ["clip-path", "mask"] {
+            if child.attribute(attr).is_some_and(|v| v != "none") {
+                let note = format!("{attr} (обрезка не сохранится)");
+                if !unsupported.contains(&note) {
+                    unsupported.push(note);
+                }
+            }
+        }
 
         match child.tag_name().name() {
             "g" | "svg" => {
@@ -2375,6 +2448,9 @@ fn collect_shapes(
                         n.in_handle = n.in_handle.map(|h| combined.apply(h));
                         n.out_handle = n.out_handle.map(|h| combined.apply(h));
                     }
+                }
+                if fill_rule_is_evenodd(child) {
+                    normalize_evenodd_contours(&mut contours);
                 }
                 let main = contours.remove(0);
                 let (nodes, closed) = (main.nodes, main.closed);
@@ -3253,6 +3329,22 @@ fn tokenize_path_d(d: &str) -> Vec<PathToken> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn open_paths_keep_their_fill_and_evenodd_holes_survive_the_round_trip() {
+        // Так пишет контуры Adobe Animate: без Z, дырка тем же обходом + evenodd.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path fill="#ff0000" fill-rule="evenodd" d="M0 0L10 0L10 10L0 10 M2 2L8 2L8 8L2 8"/><g clip-path="url(#c)"><rect width="1" height="1"/></g></svg>"##;
+        let doc = VectorDoc::from_svg_str(svg).unwrap();
+        let VectorShape::Path { nodes, extra_contours, .. } = &doc.shapes[0] else { panic!("ожидали path") };
+        let area = |pts: Vec<(f32, f32)>| -> f32 { (0..pts.len()).map(|i| { let (a, b) = (pts[i], pts[(i + 1) % pts.len()]); a.0 * b.1 - b.0 * a.1 }).sum() };
+        let outer = area(nodes.iter().map(|n| n.position).collect());
+        let hole = area(extra_contours[0].nodes.iter().map(|n| n.position).collect());
+        assert!(outer * hole < 0.0, "дырка должна идти в обратную сторону, чтобы nonzero дал тот же результат, что evenodd");
+        let out = doc.to_svg_string();
+        assert!(out.contains(r##"fill="#ff0000""##), "заливка незамкнутого пути не должна теряться: {out}");
+        assert!(doc.unsupported.iter().any(|u| u.starts_with("clip-path")), "о потерянной обрезке надо сообщить");
+    }
+
 
     #[test]
     fn multi_contour_path_keeps_every_contour_through_round_trip() {

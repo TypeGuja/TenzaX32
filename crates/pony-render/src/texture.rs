@@ -173,6 +173,13 @@ pub fn rasterize_svg_rgba(svg: &str, max_dim: u32) -> Option<(u32, u32, Vec<u8>)
 /// будет пересмотреть (например, ловить панику без подмены глобального hook,
 /// смирившись с шумным выводом, или сериализовать вызовы `load_psd`).
 pub fn load_psd(ctx: &GpuContext, path: &str, layer: Option<&str>) -> Result<LoadedTexture, TextureLoadError> {
+    let (rgba, width, height) = decode_psd_rgba(path, layer)?;
+    Ok(upload_rgba(ctx, Some(path), &rgba, width, height))
+}
+
+/// CPU-часть `load_psd`: RGBA (straight alpha) без GPU — для веб-интерфейса
+/// и CPU-экспорта.
+pub fn decode_psd_rgba(path: &str, layer: Option<&str>) -> Result<(Vec<u8>, u32, u32), TextureLoadError> {
     let bytes = std::fs::read(path).map_err(|source| TextureLoadError::PsdIo { path: path.to_string(), source })?;
 
     // Панику из psd-крейта мы ловим и обрабатываем как обычную ошибку (см.
@@ -199,7 +206,7 @@ pub fn load_psd(ctx: &GpuContext, path: &str, layer: Option<&str>) -> Result<Loa
         None => (psd_file.rgba(), psd_file.width(), psd_file.height()),
     };
 
-    Ok(upload_rgba(ctx, Some(path), &rgba, width, height))
+    Ok((rgba, width, height))
 }
 
 /// Загрузить KRA (формат Krita — zip-архив со слоями внутри). Без
@@ -208,6 +215,12 @@ pub fn load_psd(ctx: &GpuContext, path: &str, layer: Option<&str>) -> Result<Loa
 /// "сведённое изображение" у PSD без указания слоя. С `layer_file` —
 /// конкретный PNG-файл внутри архива (обычно `layers/<имя>.png`).
 pub fn load_kra(ctx: &GpuContext, path: &str, layer_file: Option<&str>) -> Result<LoadedTexture, TextureLoadError> {
+    let (rgba, width, height) = decode_kra_rgba(path, layer_file)?;
+    Ok(upload_rgba(ctx, Some(path), &rgba, width, height))
+}
+
+/// CPU-часть `load_kra` (см. `decode_psd_rgba`).
+pub fn decode_kra_rgba(path: &str, layer_file: Option<&str>) -> Result<(Vec<u8>, u32, u32), TextureLoadError> {
     let file = std::fs::File::open(path).map_err(|source| TextureLoadError::KraIo { path: path.to_string(), source })?;
     let mut archive = zip::ZipArchive::new(file).map_err(|source| TextureLoadError::KraZip { path: path.to_string(), source })?;
 
@@ -224,7 +237,8 @@ pub fn load_kra(ctx: &GpuContext, path: &str, layer_file: Option<&str>) -> Resul
         .map_err(|source| TextureLoadError::Decode { path: format!("{path}!{entry_name}"), source })?
         .to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok(upload_rgba(ctx, Some(path), &rgba, width, height))
+    let rgba = rgba.into_raw();
+    Ok((rgba, width, height))
 }
 
 fn unpremultiply(rgba: &mut [u8]) {

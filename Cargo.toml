@@ -7,12 +7,13 @@ members = [
     "crates/pony-script",
     "crates/pony-gui",
     "crates/pony-cli",
+    "crates/pony-studio",
 ]
 # Единая точка входа: `cargo run` без -p запускает GUI. pony-cli остаётся
 # в workspace (внутренний диагностический харнесс — печатает профиль
 # системы, гоняет headless-рендер и т.д.), но им теперь не обязательно
 # управлять напрямую: то же самое (кроме печати в консоль) видно в GUI.
-default-members = ["crates/pony-gui"]
+default-members = ["crates/pony-studio"]
 
 [workspace.package]
 version = "0.1.0"

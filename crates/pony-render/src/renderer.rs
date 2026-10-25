@@ -181,6 +181,12 @@ pub fn nominal_part_size(kind: PartKind) -> glam::Vec2 {
     nominal_size_and_fallback_color(kind).0
 }
 
+/// Цвет-заглушка части без ассета (линейный RGBA 0..1) — тот же, которым
+/// её рисует GPU-рендер; нужен CPU/веб-рендеру, чтобы заглушки совпадали.
+pub fn part_fallback_color(kind: PartKind) -> [f32; 4] {
+    nominal_size_and_fallback_color(kind).1
+}
+
 fn nominal_size_and_fallback_color(kind: PartKind) -> (glam::Vec2, [f32; 4]) {
     match kind {
         PartKind::Body => (glam::Vec2::new(50.0, 34.0), [0.85, 0.55, 0.75, 1.0]),
@@ -210,7 +216,7 @@ fn nominal_size_and_fallback_color(kind: PartKind) -> (glam::Vec2, [f32; 4]) {
 /// теперь у обоих потребителей (обычный рендер части и её использование
 /// как маски для другой части) одна и та же формула, а не две
 /// потенциально расходящиеся копии.
-fn part_model_matrix(part: &pony_core::part::Part, character: &Character) -> Mat4 {
+pub fn part_model_matrix(part: &pony_core::part::Part, character: &Character) -> Mat4 {
     // `world_transform_with_ik` (не голый `world_transform`) — раздел 41
     // ТЗ: IK-констрейнты должны реально влиять на рендер. Без активных
     // констрейнтов это тот же путь и та же цена, что и раньше.

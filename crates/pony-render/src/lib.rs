@@ -19,8 +19,8 @@ pub mod renderer;
 pub mod texture;
 pub use budget::LruBudget;
 pub use export::{export_gif, export_spritesheet, ExportError, SpriteSheetLayout};
-pub use renderer::{nominal_part_size, part_depth, part_morph_scale, part_render_size, part_world_position, pivot_for_world_position, FrameOutput, Renderer, DEPTH_PER_LAYER};
-pub use texture::{rasterize_svg_rgba, LoadedTexture, TextureCache, TextureLoadError};
+pub use renderer::{nominal_part_size, part_fallback_color, part_model_matrix, part_depth, part_morph_scale, part_render_size, part_world_position, pivot_for_world_position, FrameOutput, Renderer, DEPTH_PER_LAYER};
+pub use texture::{decode_kra_rgba, decode_psd_rgba, rasterize_svg_rgba, LoadedTexture, TextureCache, TextureLoadError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RenderInitError {
