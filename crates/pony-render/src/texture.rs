@@ -138,6 +138,25 @@ pub fn load_svg(ctx: &GpuContext, path: &str) -> Result<LoadedTexture, TextureLo
     Ok(upload_rgba(ctx, Some(path), &rgba, width, height))
 }
 
+/// Растеризовать SVG-строку в RGBA (straight alpha) так, чтобы бо́льшая
+/// сторона была не больше `max_dim` — для превью (например, кадров Adobe
+/// Animate в окне импорта), без GPU.
+pub fn rasterize_svg_rgba(svg: &str, max_dim: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    if size.width() <= 0.0 || size.height() <= 0.0 {
+        return None;
+    }
+    let scale = (max_dim as f32 / size.width().max(size.height())).min(SVG_UPSCALE);
+    let width = ((size.width() * scale).ceil() as u32).max(1);
+    let height = ((size.height() * scale).ceil() as u32).max(1);
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let mut rgba = pixmap.data().to_vec();
+    unpremultiply(&mut rgba);
+    Some((width, height, rgba))
+}
+
 /// Загрузить PSD: либо конкретный слой (`layer = Some(name)`), либо, если
 /// имя не задано, сведённое изображение всех видимых слоёв (`psd.rgba()`).
 ///

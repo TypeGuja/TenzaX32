@@ -15,6 +15,7 @@ pub mod particles;
 pub mod player;
 pub mod skeleton;
 pub mod vector;
+pub mod xfl;
 
 pub use boolean::{boolean_op, flatten_shape_to_contour, piece_to_shape, BooleanOp, BooleanPiece, BooleanResult};
 pub use camera::Camera;

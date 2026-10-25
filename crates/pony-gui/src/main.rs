@@ -140,7 +140,7 @@ impl Tool {
         match self {
             Tool::Selection => "Selection (V): клик — выбрать часть, тащить — двигать её",
             Tool::SubSelection => "SubSelection (A): клик — выбрать фигуру холста, тащить узлы, Delete — удалить",
-            Tool::FreeTransform => "Free Transform (Q): тащить — двигать кость части (со всем прикреплённым)",
+            Tool::FreeTransform => "Free Transform (Q): тащить — двигать кость части, Shift — вращать вокруг её точки, Alt+клик — кость-родитель (вся голова)",
             Tool::Lasso => "Lasso (L): рамкой выделить несколько частей (меню Edit — групповые операции)",
             Tool::Pen => "Pen (P): клик — точка, клик по первой — замкнуть, Enter — закончить, Esc — отмена",
             Tool::Pencil => "Pencil (Y): рисовать тонкой линией",
@@ -231,6 +231,7 @@ fn timeline_widget(
     timeline_zoom: &mut f32,
     selected_keyframe: &mut Option<(String, i64)>,
     timeline_channel: &mut BoneChannel,
+    selected_bone: &Option<String>,
 ) {
     // --- шапка: какая анимация, её длительность/цикл, зум, канал ---
     ui.horizontal(|ui| {
@@ -295,6 +296,19 @@ fn timeline_widget(
     // эту кость: это и есть правда о том, что реально анимируется.
     //
     // Показываем ТОЛЬКО дорожки выбранного канала (селектор "Канал").
+    // Плюс строки для костей БЕЗ своих частей, если их анимируют или они
+    // выбраны: у импортированных из Animate паппетов это кости-контейнеры
+    // (вся голова) — иначе их ключи попадали в "Прочее" и не редактировались.
+    let used_bones: HashSet<&str> = character.parts.values().filter_map(|p| p.bone.as_deref()).collect();
+    let animated_bones: HashSet<&str> = tracks.iter().filter_map(|t| match &t.target {
+        AnimTarget::Bone { id, .. } => Some(id.as_str()),
+        _ => None,
+    }).collect();
+    for bone in &character.skeleton.bones {
+        if bone.parent.is_some() && !used_bones.contains(bone.id.as_str()) && (animated_bones.contains(bone.id.as_str()) || selected_bone.as_deref() == Some(bone.id.as_str())) {
+            layer_ids.push(format!("{BONE_ROW_PREFIX}{}", bone.id));
+        }
+    }
     let mut layer_frames: Vec<(String, Vec<i64>)> = layer_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
     let mut misc_frames: Vec<i64> = Vec::new();
     for track in &tracks {
@@ -308,7 +322,7 @@ fn timeline_widget(
             Some(bid) => {
                 let mut any_matched = false;
                 for (lid, entry_frames) in layer_frames.iter_mut() {
-                    if character.parts[lid].bone.as_deref() == Some(bid) {
+                    if row_bone(character, lid).as_deref() == Some(bid) {
                         entry_frames.extend(frames.iter().copied());
                         any_matched = true;
                     }
@@ -372,8 +386,20 @@ fn timeline_widget(
             let bg = if i % 2 == 0 { egui::Color32::from_gray(26) } else { egui::Color32::from_gray(22) };
             lp.rect_filled(row_rect, 0.0, bg);
 
-            let is_layer_row = frames_opt.is_some();
-            if is_layer_row {
+            let is_layer_row = frames_opt.is_some() && character.parts.contains_key(label);
+            if !is_layer_row && frames_opt.is_some() {
+                // строка кости-контейнера
+                if selected_bone.as_deref() == label.strip_prefix(BONE_ROW_PREFIX) {
+                    lp.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(70, 60, 30));
+                }
+                lp.text(
+                    egui::pos2(label_rect.left() + 6.0, row_top + row_height / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(230, 200, 120),
+                );
+            } else if is_layer_row {
                 if selected.as_deref() == Some(label.as_str()) {
                     lp.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(45, 65, 90));
                 }
@@ -411,7 +437,7 @@ fn timeline_widget(
                 let row_i = ((pos.y - (label_rect.top() + ruler_height)) / row_height).floor() as i64;
                 if row_i >= 0 && (row_i as usize) < row_labels.len() {
                     let (label, frames_opt) = &row_labels[row_i as usize];
-                    if frames_opt.is_some() {
+                    if frames_opt.is_some() && character.parts.contains_key(label) {
                         let local_x = pos.x - label_rect.left();
                         if (2.0..18.0).contains(&local_x) {
                             if hidden.contains(label) {
@@ -523,7 +549,7 @@ fn timeline_widget(
                     // Тащим существующий ключ по времени — значение сохраняем.
                     let new_frame = frame_at(pos);
                     if new_frame != orig_frame {
-                        if let (Some(bone_id), Some(name)) = (character.parts.get(&label).and_then(|p| p.bone.clone()), &anim_name) {
+                        if let (Some(bone_id), Some(name)) = (row_bone(character, &label), &anim_name) {
                             if let Some(anim) = character.animations.get_mut(name) {
                                 let new_t = new_frame as f32 / FPS;
                                 // На занятый кадр не встаём — иначе insert
@@ -546,8 +572,10 @@ fn timeline_widget(
                     if let Some(row_i) = row_at(pos) {
                         let label = row_labels[row_i].0.clone();
                         if row_labels[row_i].1.is_some() {
-                            *selected = Some(label.clone());
-                            match character.parts.get(&label).and_then(|p| p.bone.clone()) {
+                            if character.parts.contains_key(&label) {
+                                *selected = Some(label.clone());
+                            }
+                            match row_bone(character, &label) {
                                 Some(bone_id) => {
                                     let frame = frame_at(pos);
                                     let t = frame as f32 / FPS;
@@ -569,14 +597,16 @@ fn timeline_widget(
                     match keyframe_at(pos) {
                         Some(hit) => {
                             let frame = hit.1;
-                            *selected = Some(hit.0.clone());
+                            if character.parts.contains_key(&hit.0) {
+                                *selected = Some(hit.0.clone());
+                            }
                             *selected_keyframe = Some(hit);
                             seek_to_frame(character, player, playing, frame);
                         }
                         None => {
                             *selected_keyframe = None;
                             if let Some(row_i) = row_at(pos) {
-                                if row_labels[row_i].1.is_some() {
+                                if row_labels[row_i].1.is_some() && character.parts.contains_key(&row_labels[row_i].0) {
                                     *selected = Some(row_labels[row_i].0.clone());
                                 }
                             }
@@ -588,7 +618,7 @@ fn timeline_widget(
 
             if delete_pressed {
                 if let Some((label, frame)) = selected_keyframe.clone() {
-                    if let (Some(bone_id), Some(name)) = (character.parts.get(&label).and_then(|p| p.bone.clone()), &anim_name) {
+                    if let (Some(bone_id), Some(name)) = (row_bone(character, &label), &anim_name) {
                         if let Some(anim) = character.animations.get_mut(name) {
                             if remove_keyframe(anim, &bone_id, *timeline_channel, frame as f32 / FPS).is_some() {
                                 *selected_keyframe = None;
@@ -600,6 +630,18 @@ fn timeline_widget(
         });
     });
     });
+}
+
+/// Префикс строки таймлайна для кости без собственной части.
+const BONE_ROW_PREFIX: &str = "кость: ";
+
+/// Кость, к которой относятся ключи строки таймлайна: у части — её кость,
+/// у строки-кости — сама кость.
+fn row_bone(character: &Character, label: &str) -> Option<String> {
+    match character.parts.get(label) {
+        Some(part) => part.bone.clone(),
+        None => label.strip_prefix(BONE_ROW_PREFIX).map(str::to_string),
+    }
 }
 
 /// Имя для новой анимации, не занятое у персонажа: "Animation",
@@ -765,6 +807,28 @@ enum Action {
     InsertKeyframe,
     ExportGif,
     ExportSpritesheet,
+    /// Импорт выбранного в окне "Adobe Animate" символа/кадра как нового
+    /// персонажа сцены.
+    ImportXfl,
+}
+
+/// Папка для SVG-частей, импортированных из Adobe Animate:
+/// `imported/<документ>/<символ>_f<кадр>/`. В `.gitignore` — исходники
+/// (особенно чужие, как MLP-паппеты) в репозиторий попадать не должны.
+fn xfl_import_dir(doc_name: &str, symbol: Option<&str>, frame: usize) -> std::path::PathBuf {
+    let clean = |s: &str| -> String { s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect() };
+    std::path::Path::new("imported").join(clean(doc_name)).join(format!("{}_f{frame}", clean(symbol.unwrap_or("main"))))
+}
+
+/// Символ, который разумно показать сразу после открытия .fla: у паппетов
+/// MLP это контейнер персонажа (`~RD_Character`), иначе главная шкала.
+fn default_xfl_symbol(doc: &pony_core::xfl::XflDocument) -> Option<String> {
+    let names = doc.symbol_names();
+    names
+        .iter()
+        .find(|n| n.starts_with('~') && n.to_lowercase().contains("character"))
+        .or_else(|| names.iter().find(|n| n.starts_with('~')))
+        .map(|n| n.to_string())
 }
 
 /// Как подогнать вид Stage (см. View > Fit ...).
@@ -1652,6 +1716,20 @@ fn main() {
     // известен размер холста. При старте — крупно на персонажа (раньше
     // он занимал ~30px посреди огромного голубого поля).
     let mut fit_request: Option<FitView> = Some(FitView::Character);
+    // --- импорт Adobe Animate (.fla/.xfl): окно с выбором символа и кадра ---
+    let mut xfl_window_open = false;
+    let mut xfl_path = String::new();
+    let mut xfl_doc: Option<pony_core::xfl::XflDocument> = None;
+    let mut xfl_symbol: Option<String> = None; // None — главная шкала документа
+    let mut xfl_frame: usize = 0;
+    let mut xfl_filter = String::new();
+    let mut xfl_opts = pony_core::xfl::ImportOptions { scale: 1.0, expand_containers: true };
+    let mut xfl_preview: Option<egui::TextureHandle> = None;
+    let mut xfl_preview_key: Option<(Option<String>, usize)> = None;
+    let mut xfl_info = String::new();
+    // Загрузка документа отложена на конец кадра (может занять секунду на
+    // больших .fla) — запрос ставят кнопка "Загрузить" и File > Open.
+    let mut xfl_load_request = false;
     let mut blank_layer_count: u32 = 0;
     let mut show_rulers = true;
 
@@ -1910,6 +1988,11 @@ fn main() {
                                                 status_message = "Путь Pen отменён".into();
                                             } else if placing_bone {
                                                 placing_bone = false;
+                                            } else if active_tool == Tool::FreeTransform && selected_bone.is_some() {
+                                                // Выйти из выбранной кости (например, контейнера
+                                                // головы) — следующий клик возьмёт кость части.
+                                                selected_bone = None;
+                                                status_message = "Xform: выбор кости снят".into();
                                             } else if !multi_selected.is_empty() {
                                                 multi_selected.clear();
                                             } else {
@@ -1944,6 +2027,7 @@ fn main() {
                                 egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                                     egui::menu::bar(ui, |ui| {
                                         ui.menu_button("File", |ui| {
+                                            ui.set_min_width(300.0);
                                             if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() {
                                                 actions.push(Action::New);
                                                 ui.close_menu();
@@ -1962,7 +2046,12 @@ fn main() {
                                                 ui.label("Файл:");
                                                 ui.add(egui::TextEdit::singleline(&mut asset_path).desired_width(200.0));
                                             });
+                                            ui.weak(".asset — персонаж; .fla/.xfl — откроется окно импорта Adobe Animate");
                                             ui.separator();
+                                            if ui.button("Import Adobe Animate (.fla/.xfl)…").clicked() {
+                                                xfl_window_open = true;
+                                                ui.close_menu();
+                                            }
                                             ui.separator();
                                             // Импорт ассетов: движок умеет PNG/SVG/PSD/KRA, но
                                             // до этого добраться до них из GUI было нельзя
@@ -2328,6 +2417,8 @@ fn main() {
                                                 "Колесо — зум к курсору, средняя кнопка — пан",
                                                 "Ctrl+1 / Ctrl+2 / Ctrl+3 — 100% / документ / персонаж",
                                                 "V A Q L — Sel/SubSel/Xform/Lasso",
+                                                "Xform: тащить — двигать кость, Shift — вращать, Alt+клик — кость-родитель, Esc — снять",
+                                                "File > Import Adobe Animate — открыть .fla/.xfl, выбрать символ и кадр",
                                                 "P Y B N R O — Pen/Pencil/Brush/Line/Rect/Oval",
                                                 "K S I — Fill/Ink/Eyedropper, H Z — Hand/Zoom",
                                                 "Pen: клик — точка, клик по первой — замкнуть, Enter — закончить, Esc — отмена",
@@ -3597,6 +3688,113 @@ fn main() {
                                     });
                                 }
 
+                                // --- окно импорта Adobe Animate ---
+                                if xfl_window_open {
+                                    let mut open = true;
+                                    egui::Window::new("Импорт Adobe Animate").open(&mut open).default_width(640.0).default_pos(egui::pos2(220.0, 70.0)).show(ctx, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Файл .fla / .xfl / папка XFL:");
+                                            let r = ui.add(egui::TextEdit::singleline(&mut xfl_path).desired_width(330.0).hint_text("../alkash3d-engine/assets/mlp/fla/....fla"));
+                                            if ui.button("Загрузить").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                                xfl_load_request = true;
+                                            }
+                                        });
+                                        if !xfl_info.is_empty() {
+                                            ui.small(&xfl_info);
+                                        }
+                                        let Some(doc) = &xfl_doc else {
+                                            ui.weak("Диалога выбора файла нет — впиши путь (относительно папки запуска или абсолютный) и нажми «Загрузить».");
+                                            return;
+                                        };
+                                        ui.separator();
+                                        ui.horizontal_top(|ui| {
+                                            // Левая колонка: символы библиотеки.
+                                            ui.vertical(|ui| {
+                                                ui.set_width(230.0);
+                                                ui.add(egui::TextEdit::singleline(&mut xfl_filter).hint_text("поиск символа…"));
+                                                egui::ScrollArea::vertical().id_source("xfl_symbols").max_height(380.0).show(ui, |ui| {
+                                                    if ui.selectable_label(xfl_symbol.is_none(), format!("(главная шкала, {} кадр.)", doc.main.frame_count())).clicked() {
+                                                        xfl_symbol = None;
+                                                        xfl_frame = 0;
+                                                    }
+                                                    let filter = xfl_filter.to_lowercase();
+                                                    // Контейнеры "~..." (персонаж, голова) — первыми.
+                                                    let mut names = doc.symbol_names();
+                                                    names.sort_by_key(|n| (!n.starts_with('~'), n.to_lowercase()));
+                                                    for name in names.into_iter().filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter)) {
+                                                        let frames = doc.symbols[name].frame_count();
+                                                        if ui.selectable_label(xfl_symbol.as_deref() == Some(name), format!("{name}  ·{frames}")).clicked() {
+                                                            xfl_symbol = Some(name.to_string());
+                                                            xfl_frame = 0;
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            ui.separator();
+                                            // Правая колонка: кадр, превью, параметры.
+                                            ui.vertical(|ui| {
+                                                let Some(tl) = doc.timeline(xfl_symbol.as_deref()) else { return };
+                                                let count = tl.frame_count();
+                                                xfl_frame = xfl_frame.min(count - 1);
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Кадр:");
+                                                    ui.add(egui::Slider::new(&mut xfl_frame, 0..=count - 1));
+                                                    if ui.small_button("◀").clicked() {
+                                                        xfl_frame = xfl_frame.saturating_sub(1);
+                                                    }
+                                                    if ui.small_button("▶").clicked() {
+                                                        xfl_frame = (xfl_frame + 1).min(count - 1);
+                                                    }
+                                                });
+                                                let labels = tl.frame_labels();
+                                                if !labels.is_empty() {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.weak("Метки:");
+                                                        for (idx, label) in &labels {
+                                                            if ui.small_button(format!("{label} ({idx})")).clicked() {
+                                                                xfl_frame = *idx;
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                // Превью перерисовывается только при смене символа/кадра.
+                                                let key = (xfl_symbol.clone(), xfl_frame);
+                                                if xfl_preview_key.as_ref() != Some(&key) {
+                                                    xfl_preview_key = Some(key);
+                                                    xfl_preview = doc
+                                                        .render_svg(xfl_symbol.as_deref(), xfl_frame)
+                                                        .and_then(|r| pony_render::rasterize_svg_rgba(&r.svg, 360))
+                                                        .map(|(w, h, rgba)| ctx.load_texture("xfl-preview", egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba), egui::TextureOptions::LINEAR));
+                                                }
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(370.0, 300.0), egui::Sense::hover());
+                                                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(235));
+                                                match &xfl_preview {
+                                                    Some(tex) => {
+                                                        let size = tex.size_vec2();
+                                                        let k = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
+                                                        let img = egui::Rect::from_center_size(rect.center(), size * k);
+                                                        ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                                                    }
+                                                    None => {
+                                                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "(пустой кадр)", egui::FontId::proportional(13.0), egui::Color32::from_gray(90));
+                                                    }
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Масштаб:");
+                                                    ui.add(egui::DragValue::new(&mut xfl_opts.scale).speed(0.01).clamp_range(0.01..=10.0)).on_hover_text("Мировых единиц на пиксель Animate");
+                                                    ui.checkbox(&mut xfl_opts.expand_containers, "Раскрыть «~»-контейнеры")
+                                                        .on_hover_text("Вложенные символы с именем на «~» (например ~RD_Head) раскладываются на отдельные части: глаза, рот, брови…");
+                                                });
+                                                ui.small("Каждый слой станет частью со своей костью в точке трансформации Animate — её можно двигать, вращать и анимировать.");
+                                                if ui.button("Импортировать как нового персонажа").clicked() {
+                                                    actions.push(Action::ImportXfl);
+                                                }
+                                            });
+                                        });
+                                    });
+                                    xfl_window_open = open;
+                                }
+
                                 // Timeline — TopBottomPanel::bottom, но добавлена ЗДЕСЬ,
                                 // после боковых панелей, а не раньше них. Раньше стояла
                                 // перед SidePanel::left/right — из-за чего при своей
@@ -3681,6 +3879,7 @@ fn main() {
                                                 &mut timeline_zoom,
                                                 &mut selected_keyframe,
                                                 &mut timeline_channel,
+                                                &selected_bone,
                                             );
                                         }
 
@@ -3928,17 +4127,90 @@ fn main() {
                                     }
 
                                     if active_tool == Tool::FreeTransform {
-                                        // Нажатие на другую часть выбирает её (как в Selection),
-                                        // иначе Xform двигал кость старого выделения.
+                                        // Что двигаем/вращаем — решается в момент нажатия:
+                                        // точка кости (если скелет показан) -> эта кость;
+                                        // часть -> её кость, с Alt — кость-родитель (у
+                                        // импортированных из Animate паппетов это контейнер:
+                                        // Alt+клик по глазу берёт всю голову); пустое место —
+                                        // кость выбранного слоя. Цель — `selected_bone`.
                                         if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
                                             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
-                                                if let Some(hit) = part_at(&character, &hidden_layers, &locked_layers, screen_to_world(origin)) {
-                                                    selected_layer = Some(hit);
+                                                let alt = ui.input(|i| i.modifiers.alt);
+                                                let bone_hit = if show_skeleton {
+                                                    character
+                                                        .skeleton
+                                                        .bones
+                                                        .iter()
+                                                        .filter_map(|b| character.skeleton.world_transform(&b.id).map(|w| (b.id.clone(), world_to_screen(w.position).distance(origin))))
+                                                        .filter(|(_, d)| *d < 8.0)
+                                                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                                                        .map(|(id, _)| id)
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some(b) = bone_hit {
+                                                    selected_bone = Some(b);
+                                                } else {
+                                                    if let Some(hit) = part_at(&character, &hidden_layers, &locked_layers, screen_to_world(origin)) {
+                                                        selected_layer = Some(hit);
+                                                    }
+                                                    let mut bone = selected_layer.as_ref().and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone());
+                                                    // Уже выбран предок этой кости (например, вся голова
+                                                    // через Alt) — остаёмся на нём: тащить голову можно
+                                                    // за любой её элемент, как группу в Animate.
+                                                    let mut ancestor = bone.as_ref().and_then(|b| character.skeleton.find(b)).and_then(|b| b.parent.clone());
+                                                    let mut guard = 0;
+                                                    while let Some(a) = ancestor.clone() {
+                                                        if selected_bone.as_deref() == Some(a.as_str()) && character.skeleton.find(&a).is_some_and(|b| b.parent.is_some()) {
+                                                            bone = Some(a);
+                                                            break;
+                                                        }
+                                                        ancestor = character.skeleton.find(&a).and_then(|b| b.parent.clone());
+                                                        guard += 1;
+                                                        if guard > 256 {
+                                                            break;
+                                                        }
+                                                    }
+                                                    if alt {
+                                                        if let Some(parent) = bone.as_ref().and_then(|b| character.skeleton.find(b)).and_then(|b| b.parent.clone()) {
+                                                            if character.skeleton.find(&parent).is_some_and(|p| p.parent.is_some()) {
+                                                                bone = Some(parent);
+                                                            }
+                                                        }
+                                                    }
+                                                    if bone.is_some() {
+                                                        selected_bone = bone;
+                                                    }
+                                                }
+                                                if let Some(b) = &selected_bone {
+                                                    status_message = format!("Xform: кость '{b}' (тащить — двигать, Shift — вращать, Alt+клик — кость-родитель)");
                                                 }
                                             }
                                         }
-                                        if response.dragged_by(egui::PointerButton::Primary) {
-                                            if let Some(bone_id) = selected_layer.as_ref().filter(|id| !locked_layers.contains(*id)).and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone()) {
+                                        let layer_locked = selected_layer.as_ref().is_some_and(|id| locked_layers.contains(id));
+                                        if response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.shift) && !layer_locked {
+                                            // Shift — поворот вокруг точки кости (в Animate — угол
+                                            // Free Transform). Угол между прошлой и текущей позицией
+                                            // курсора относительно кости, в мировых координатах.
+                                            if let (Some(bone_id), Some(pos)) = (selected_bone.clone(), response.interact_pointer_pos()) {
+                                                if let Some(center) = character.skeleton.world_transform(&bone_id).map(|w| w.position) {
+                                                    let prev = screen_to_world(pos - response.drag_delta()) - center;
+                                                    let cur = screen_to_world(pos) - center;
+                                                    if prev.length() > 1e-3 && cur.length() > 1e-3 {
+                                                        let mut da = cur.y.atan2(cur.x) - prev.y.atan2(prev.x);
+                                                        if da > std::f32::consts::PI {
+                                                            da -= std::f32::consts::TAU;
+                                                        } else if da < -std::f32::consts::PI {
+                                                            da += std::f32::consts::TAU;
+                                                        }
+                                                        if let Some(bone) = character.skeleton.bones.iter_mut().find(|b| b.id == bone_id) {
+                                                            bone.local_transform.rotation += da;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if response.dragged_by(egui::PointerButton::Primary) && !layer_locked {
+                                            if let Some(bone_id) = selected_bone.clone().filter(|b| character.skeleton.find(b).is_some()) {
                                                 let delta_screen = response.drag_delta();
                                                 let delta_frame = glam::Vec2::new(delta_screen.x, -delta_screen.y) / stage_zoom;
                                                 let delta_after_cam = delta_frame * inv_zoom;
@@ -4413,9 +4685,94 @@ fn main() {
                                 });
                             });
 
+                            // --- загрузка документа Adobe Animate (окно импорта) ---
+                            if std::mem::take(&mut xfl_load_request) {
+                                let path = xfl_path.trim().to_string();
+                                let t = Instant::now();
+                                match pony_core::xfl::XflDocument::open(&path) {
+                                    Ok(doc) => {
+                                        xfl_info = format!(
+                                            "{}: {} символов, сцена {}×{}, {} fps — загружено за {:.1} с{}",
+                                            doc.name,
+                                            doc.symbols.len(),
+                                            doc.width,
+                                            doc.height,
+                                            doc.frame_rate,
+                                            t.elapsed().as_secs_f32(),
+                                            if doc.warnings.is_empty() { String::new() } else { format!(" (пропущено битых символов: {})", doc.warnings.len()) }
+                                        );
+                                        xfl_symbol = default_xfl_symbol(&doc);
+                                        xfl_frame = 0;
+                                        xfl_preview_key = None;
+                                        status_message = format!("Adobe Animate: открыт {path}");
+                                        xfl_doc = Some(doc);
+                                    }
+                                    Err(err) => {
+                                        xfl_info = format!("Не удалось открыть {path}: {err}");
+                                        status_message = xfl_info.clone();
+                                    }
+                                }
+                                xfl_window_open = true;
+                                needs_redraw = true;
+                            }
+
                             // --- действия из меню/тулбара/горячих клавиш ---
                             for action in actions.drain(..) {
                                 match action {
+                                    // File > Open с путём к .fla/.xfl или папке XFL — это
+                                    // документ Adobe Animate, а не .asset: открываем окно импорта.
+                                    Action::Open
+                                        if std::path::Path::new(asset_path.trim()).is_dir()
+                                            || std::path::Path::new(asset_path.trim())
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .is_some_and(|e| e.eq_ignore_ascii_case("fla") || e.eq_ignore_ascii_case("xfl")) =>
+                                    {
+                                        xfl_path = asset_path.trim().to_string();
+                                        xfl_load_request = true;
+                                    }
+                                    Action::ImportXfl => {
+                                        let Some(doc) = &xfl_doc else { continue };
+                                        let out_dir = xfl_import_dir(&doc.name, xfl_symbol.as_deref(), xfl_frame);
+                                        match pony_core::xfl::import_to_character(doc, xfl_symbol.as_deref(), xfl_frame, &xfl_opts, &out_dir) {
+                                            Ok((imported, report)) => {
+                                                // Новый персонаж сцены — текущий уходит в список
+                                                // остальных (как "+ Новый персонаж" на таймлайне).
+                                                new_character_count += 1;
+                                                let name = format!("{} {new_character_count}", imported.name);
+                                                other_characters.push(CharacterSlot {
+                                                    character: std::mem::replace(&mut character, imported),
+                                                    player: std::mem::replace(&mut player, AnimationPlayer::new()),
+                                                    name: std::mem::replace(&mut active_character_name, name),
+                                                });
+                                                // Перезаписанные SVG (повторный импорт того же кадра)
+                                                // не должны браться из кэша текстур.
+                                                for part in character.parts.values() {
+                                                    if let PartSource::Vector { path } = &part.source {
+                                                        pony_renderer.invalidate_texture(path);
+                                                    }
+                                                }
+                                                playing = false;
+                                                selected_layer = None;
+                                                selected_bone = None;
+                                                selected_keyframe = None;
+                                                multi_selected.clear();
+                                                hidden_layers.clear();
+                                                locked_layers.clear();
+                                                show_skeleton = false;
+                                                history.reset(&character, &vector_doc);
+                                                fit_request = Some(FitView::Character);
+                                                xfl_window_open = false;
+                                                status_message = format!(
+                                                    "Импортировано: {} частей -> {}{}",
+                                                    report.parts,
+                                                    report.out_dir.display(),
+                                                    if report.unsupported > 0 { format!(" (пропущено текста/картинок: {})", report.unsupported) } else { String::new() }
+                                                );
+                                            }
+                                            Err(err) => status_message = format!("Импорт не удался: {err}"),
+                                        }
+                                    }
                                     Action::New => {
                                         character = build_walking_pony();
                                         pick_default_animation(&character, &mut player);
@@ -4513,7 +4870,13 @@ fn main() {
                                         player.apply(&mut character);
                                     }
                                     Action::InsertKeyframe => {
-                                        let bone = selected_layer.as_ref().and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone());
+                                        // В Xform ключ ставится той кости, которую двигаешь
+                                        // (например, кости-контейнеру головы), иначе — кости слоя.
+                                        let bone = if active_tool == Tool::FreeTransform && selected_bone.as_ref().is_some_and(|b| character.skeleton.find(b).is_some()) {
+                                            selected_bone.clone()
+                                        } else {
+                                            selected_layer.as_ref().and_then(|id| character.parts.get(id)).and_then(|p| p.bone.clone())
+                                        };
                                         match (selected_layer.clone(), bone) {
                                             (Some(layer_id), Some(bone_id)) => {
                                                 let value = character.skeleton.find(&bone_id).map(|b| bone_channel_value(b, timeline_channel)).unwrap_or(0.0);
