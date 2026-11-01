@@ -48,12 +48,16 @@ const Stage = {
     this.bg = svgEl('rect', { x: 0, y: 0, width: '100%', height: '100%', fill: 'rgb(135,207,235)' });
     this.world = svgEl('g');
     this.partsG = svgEl('g');
+    this.onionG = svgEl('g');
     this.particlesG = svgEl('g');
     this.vecG = svgEl('g', { transform: 'scale(1,-1)' });
-    this.world.append(this.partsG, this.particlesG, this.vecG);
+    this.world.append(this.onionG, this.partsG, this.particlesG, this.vecG);
     this.dim = svgEl('path', { fill: 'rgba(30,30,34,0.78)', 'fill-rule': 'evenodd' });
     this.border = svgEl('rect', { fill: 'none', stroke: '#0e0e10', 'stroke-width': 1.5 });
     this.overlay = svgEl('g');
+    // Onion skin: прошлые кадры синие, будущие зелёные (как в Animate).
+    this.defs.innerHTML = ['prev', '0.25 0.45 1', 'next', '0.2 0.85 0.35'].reduce((acc, v, i, a) => i % 2 ? acc : acc +
+      `<filter id="onion-${v}" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="0 0 0 0 ${a[i + 1].split(' ')[0]} 0 0 0 0 ${a[i + 1].split(' ')[1]} 0 0 0 0 ${a[i + 1].split(' ')[2]} 0 0 0 1 0"/></filter>`, '');
     this.svg.append(this.defs, this.bg, this.world, this.dim, this.border, this.overlay);
     this.view.appendChild(this.svg);
     this.hud = document.getElementById('stage-hud');
@@ -144,7 +148,7 @@ const Stage = {
       this.lastFit = S.ui.fit.n;
       this.fit(S.ui.fit.kind);
     }
-    if (changed.frame) this.renderParts();
+    if (changed.frame) { this.renderParts(); this.renderOnion(); }
     if (changed.vec) this.vecG.innerHTML = S.vec.markup;
     if (changed.vec || changed.frame) this.vecG.setAttribute('transform', M.str(S.vec.map));
     if (changed.ui) this.view.className = this.cursorClass();
@@ -215,6 +219,22 @@ const Stage = {
       }
     }
     this.particlesG.innerHTML = S.frame.particles.map(p => `<rect x="${p[0] - p[2] / 2}" y="${p[1] - p[2] / 2}" width="${p[2]}" height="${p[2]}" fill="${p[3]}"/>`).join('');
+  },
+
+  /** Призраки соседних кадров: статичная разметка, пересобирается целиком. */
+  renderOnion() {
+    const ghosts = S.frame.onion || [];
+    const quad = (it, extra = '') => it.href
+      ? `<image x="-0.5" y="-0.5" width="1" height="1" preserveAspectRatio="none" href="${esc(it.href)}" transform="${M.str(M.mul(it.m, FLIP))}"${extra}/>`
+      : `<rect x="-0.5" y="-0.5" width="1" height="1" fill="${it.fill}" transform="${M.str(M.mul(it.m, FLIP))}"${extra}/>`;
+    this.onionG.innerHTML = ghosts.map((g, gi) => {
+      const body = g.items.map((it, i) => {
+        if (!it.mask) return quad(it);
+        const id = `og${gi}_${i}`;
+        return `<mask id="${id}" mask-type="alpha" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="-1e5" y="-1e5" width="2e5" height="2e5">${quad(it.mask)}</mask><g mask="url(#${id})">${quad(it)}</g>`;
+      }).join('');
+      return `<g opacity="${g.far ? 0.14 : 0.28}" filter="url(#onion-${g.dir < 0 ? 'prev' : 'next'})">${body}</g>`;
+    }).join('');
   },
 
   /** Квад [-0.5..0.5] с картинкой части (или заглушкой цветом). */

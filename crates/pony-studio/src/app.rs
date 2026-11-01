@@ -408,6 +408,8 @@ pub struct App {
     selected_bone: Option<String>,
     placing_bone: bool,
     show_skeleton: bool,
+    /// Onion skin: показывать соседние кадры полупрозрачными.
+    onion: bool,
     bone_count: u32,
     selected_shape: Option<usize>,
     dragging_point: Option<usize>,
@@ -488,6 +490,7 @@ impl App {
             selected_bone: None,
             placing_bone: false,
             show_skeleton: true,
+            onion: false,
             bone_count: 0,
             selected_shape: None,
             dragging_point: None,
@@ -1031,6 +1034,10 @@ impl App {
             }
             "poly_sides" => {
                 self.poly_sides = a.i("n").unwrap_or(6).clamp(3, 12) as u32;
+                Ok(Value::Null)
+            }
+            "onion" => {
+                self.onion = a.b("on");
                 Ok(Value::Null)
             }
             "show_skeleton" => {
@@ -2280,6 +2287,7 @@ impl App {
             "hidden": sorted(&self.hidden),
             "locked": sorted(&self.locked),
             "show_skeleton": self.show_skeleton,
+            "onion": self.onion,
             "placing_bone": self.placing_bone,
             "status": self.status,
             "undo": self.history.undo.len(),
@@ -2371,6 +2379,35 @@ impl App {
         json!({ "time": self.player.time(), "frame": (self.player.time() * FPS).round() as i64, "total": total, "playing": self.playing })
     }
 
+    /// Onion skin: позы соседних кадров текущей анимации (раньше — `dir`
+    /// = -1, позже — +1). Во время воспроизведения не считаются.
+    fn onion_frames(&self, visible: &Character) -> Vec<Value> {
+        let Some(anim) = self.player.current_name().and_then(|n| self.character.animations.get(n)) else { return Vec::new() };
+        if !self.onion || self.playing || anim.duration <= 0.0 {
+            return Vec::new();
+        }
+        let now = self.player.time();
+        let mut out = Vec::new();
+        for k in [-2i32, -1, 1, 2] {
+            let mut t = now + (k * ONION_STEP) as f32 / FPS;
+            if anim.looping {
+                t = t.rem_euclid(anim.duration);
+            } else if !(0.0..=anim.duration).contains(&t) {
+                continue;
+            }
+            if (t - now).abs() < 0.5 / FPS {
+                continue;
+            }
+            let mut ghost = visible.clone();
+            let mut player = self.player.clone();
+            player.seek(&ghost, t);
+            player.apply(&mut ghost);
+            let items: Vec<Value> = scene::draw_list(&ghost, &pony_core::Lighting::default()).into_iter().map(draw_item_json).collect();
+            out.push(json!({ "dir": k.signum(), "far": k.abs() > 1, "items": items }));
+        }
+        out
+    }
+
     fn sec_frame(&self) -> Value {
         let mut visible = self.visible_character();
         // Пока часть правится на холсте, её старая картинка не рисуется —
@@ -2378,20 +2415,8 @@ impl App {
         if let Some(id) = &self.editing_part {
             visible.parts.remove(id);
         }
-        let items: Vec<Value> = scene::draw_list(&visible, &self.lighting)
-            .into_iter()
-            .map(|it| {
-                let css = |c: [u8; 4]| format!("rgba({},{},{},{})", c[0], c[1], c[2], c[3] as f32 / 255.0);
-                json!({
-                    "id": it.id,
-                    "href": it.asset.as_ref().map(scene::Asset::url),
-                    "fill": css(it.fallback),
-                    "m": it.model.0,
-                    "light": it.light,
-                    "mask": it.mask.map(|m| json!({ "href": m.asset.as_ref().map(scene::Asset::url), "fill": css(m.fallback), "m": m.model.0 })),
-                })
-            })
-            .collect();
+        let onion = self.onion_frames(&visible);
+        let items: Vec<Value> = scene::draw_list(&visible, &self.lighting).into_iter().map(draw_item_json).collect();
         let particles: Vec<Value> = if self.particles_enabled {
             scene::particle_list(&self.emitter).into_iter().map(|p| json!([p.x, p.y, p.size, format!("rgba({},{},{},{})", p.color[0], p.color[1], p.color[2], p.color[3] as f32 / 255.0)])).collect()
         } else {
@@ -2416,6 +2441,7 @@ impl App {
         let shake = self.camera.shake_offset(self.elapsed);
         json!({
             "items": items,
+            "onion": onion,
             "particles": particles,
             "camera": { "x": self.camera.position.x + shake.x, "y": self.camera.position.y + shake.y, "rot": self.camera.rotation, "zoom": self.camera.zoom.max(0.0001) },
             "bones": bones,
@@ -2554,6 +2580,21 @@ fn particle_kind_from(s: &str) -> Option<pony_core::ParticleKind> {
     [Dust, Snow, Rain, Spark, Magic, Smoke, Cloud].into_iter().find(|k| format!("{k:?}") == s)
 }
 
+/// Шаг onion skin в кадрах: призраки на ±2 и ±4 кадрах от текущего.
+const ONION_STEP: i32 = 2;
+
+fn draw_item_json(it: scene::DrawItem) -> Value {
+    let css = |c: [u8; 4]| format!("rgba({},{},{},{})", c[0], c[1], c[2], c[3] as f32 / 255.0);
+    json!({
+        "id": it.id,
+        "href": it.asset.as_ref().map(scene::Asset::url),
+        "fill": css(it.fallback),
+        "m": it.model.0,
+        "light": it.light,
+        "mask": it.mask.map(|m| json!({ "href": m.asset.as_ref().map(scene::Asset::url), "fill": css(m.fallback), "m": m.model.0 })),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2595,6 +2636,24 @@ mod tests {
         assert!(!app.character.parts.contains_key("drawn_1"));
         assert_eq!(app.vector_doc.shapes.len(), 1, "отмена возвращает и холст");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn onion_skin_shows_neighbour_poses_only_when_enabled_and_paused() {
+        let mut app = App::new();
+        cmd(&mut app, "demo", json!({}));
+        cmd(&mut app, "seek", json!({ "op": "frame", "frame": 6 }));
+        assert!(app.sec_frame()["onion"].as_array().unwrap().is_empty());
+        cmd(&mut app, "onion", json!({ "on": true }));
+        let frame = app.sec_frame();
+        let ghosts = frame["onion"].as_array().unwrap();
+        assert_eq!(ghosts.len(), 4);
+        assert_eq!(ghosts.iter().filter(|g| g["dir"] == -1).count(), 2);
+        // хотя бы одна часть у призрака стоит иначе, чем в текущем кадре
+        let moved = ghosts.iter().any(|g| g["items"].as_array().unwrap().iter().zip(frame["items"].as_array().unwrap()).any(|(a, b)| a["m"] != b["m"]));
+        assert!(moved, "призраки должны показывать другие позы");
+        app.playing = true;
+        assert!(app.sec_frame()["onion"].as_array().unwrap().is_empty());
     }
 
     #[test]

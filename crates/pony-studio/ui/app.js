@@ -268,6 +268,7 @@ function menuDefs() {
       { label: 'Таймлайн', fn: () => App.showTimeline(!App.timelineOn), checked: App.timelineOn },
       { label: 'Правая панель', fn: () => App.showPanel(!App.panelOn), checked: App.panelOn },
       { label: 'Скелет', fn: () => rpc('show_skeleton', { on: !ui.show_skeleton }), checked: ui.show_skeleton },
+      sc('Shift+O', 'Onion skin (соседние кадры)', () => rpc('onion', { on: !ui.onion }), { checked: ui.onion }),
     ]],
     ['Вставка', [
       sc('F6', `Ключевой кадр (${ui.channel_label})`, () => rpc('insert_keyframe'), { icon: 'key', disabled: !hasSel }),
@@ -503,6 +504,7 @@ window.addEventListener('keydown', e => {
   else if (key === 'ArrowLeft' || key === ',') rpc('seek', { op: 'prev' });
   else if (key === 'ArrowRight' || key === '.') rpc('seek', { op: 'next' });
   else if (key === 'F6') rpc('insert_keyframe');
+  else if (e.shiftKey && code === 'KeyO') rpc('onion', { on: !S.ui.onion });
   else if (key === 'Delete' || key === 'Backspace') Actions.deleteKey();
   else if (key === 'Escape') Actions.escape();
   else if (key === 'Enter' && Stage.pen.length >= 2) Stage.penCommit(false);
