@@ -49,10 +49,14 @@ fn places() -> Vec<(String, PathBuf)> {
 }
 
 fn recent_file() -> Option<PathBuf> {
+    config_file("recent_dirs.txt")
+}
+
+fn config_file(name: &str) -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home_dir().map(|h| h.join(".config"))))?;
-    Some(base.join("pony-engine").join("recent_dirs.txt"))
+    Some(base.join("pony-engine").join(name))
 }
 
 pub fn load_recent() -> Vec<PathBuf> {
@@ -75,6 +79,34 @@ pub fn remember(dir: &Path) {
             let _ = std::fs::create_dir_all(parent);
         }
         let text: String = recent.iter().map(|d| format!("{}\n", d.display())).collect();
+        let _ = std::fs::write(f, text);
+    }
+}
+
+const MAX_RECENT_FILES: usize = 8;
+
+/// Недавно открытые/сохранённые файлы персонажей (только существующие).
+pub fn load_recent_files() -> Vec<String> {
+    config_file("recent_files.txt")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.lines().filter(|p| Path::new(p).is_file()).take(MAX_RECENT_FILES).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Ставит файл первым в список недавних и сохраняет список на диск.
+pub fn remember_file(list: &mut Vec<String>, path: &str) {
+    let abs = std::fs::canonicalize(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
+    list.retain(|p| *p != abs);
+    list.insert(0, abs);
+    list.truncate(MAX_RECENT_FILES);
+    if cfg!(test) {
+        return;
+    }
+    if let Some(f) = config_file("recent_files.txt") {
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let text: String = list.iter().map(|p| format!("{p}\n")).collect();
         let _ = std::fs::write(f, text);
     }
 }
@@ -203,6 +235,15 @@ pub fn mkdir(dir: &str, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_files_dedupe_and_cap() {
+        let mut list: Vec<String> = (0..10).map(|i| format!("/nope/{i}.asset")).collect();
+        remember_file(&mut list, "/nope/5.asset");
+        assert_eq!(list[0], "/nope/5.asset");
+        assert_eq!(list.len(), 8);
+        assert_eq!(list.iter().filter(|p| *p == "/nope/5.asset").count(), 1);
+    }
+
     use super::*;
 
     #[test]

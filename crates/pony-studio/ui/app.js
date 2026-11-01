@@ -78,11 +78,7 @@ window.__pony = {
     const animate = paths.find(p => ['fla', 'xfl'].includes(ext(p)));
     const layers = paths.filter(p => ['png', 'svg', 'psd', 'kra'].includes(ext(p)));
     if (asset) {
-      if (S.ui.dirty) {
-        const v = await confirmDialog(h('div', null, h('b', null, 'Открыть другой файл?'), h('p', { class: 'hint' }, 'Несохранённые правки персонажа будут потеряны.')), 'Сохранить и открыть', 'Не сохранять');
-        if (v === false || v === undefined || (v === true && !await Actions.save())) return;
-      }
-      await rpc('open', { path: asset });
+      await Actions.openPath(asset);
     } else if (animate) {
       XflWindow.open();
       await rpc('xfl_load', { path: animate });
@@ -134,7 +130,15 @@ function tickLoop(t) {
 const Actions = {
   async open() {
     const p = await fileDialog('open', { start: S.ui.asset_path });
-    if (p) await rpc('open', { path: p });
+    if (p) await this.openPath(p);
+  },
+  /** Открыть файл; если есть несохранённые правки — сначала спросить. */
+  async openPath(p) {
+    if (S.ui.dirty && /\.asset$/i.test(p)) {
+      const v = await confirmDialog(h('div', null, h('b', null, 'Открыть другой файл?'), h('p', { class: 'hint' }, 'Несохранённые правки персонажа будут потеряны.')), 'Сохранить и открыть', 'Не сохранять');
+      if (v === false || (v === true && !await this.save())) return;
+    }
+    await rpc('open', { path: p });
   },
   async save() {
     const r = await rpc('save');
@@ -222,6 +226,9 @@ function menuDefs() {
     ['Файл', [
       sc('Ctrl+N', 'Новый', () => rpc('new'), { icon: 'new' }),
       sc('Ctrl+O', 'Открыть…', () => Actions.open(), { icon: 'open' }),
+      ...(ui.recent_files.length ? [{ note: 'Недавние' }, ...ui.recent_files.map(p => ({
+        label: p.split(/[\\/]/).pop(), title: p, fn: () => Actions.openPath(p), icon: 'clock',
+      }))] : []),
       sc('Ctrl+S', 'Сохранить', () => Actions.save(), { icon: 'save' }),
       sc('Ctrl+Shift+S', 'Сохранить как…', () => Actions.saveAs()),
       { note: ui.asset_path ? 'Файл: ' + ui.asset_path : 'Документ ещё не сохранён' },
@@ -329,7 +336,7 @@ const Chrome = {
       const dd = h('div', { class: 'dropdown' }, ...items.map(it => {
         if (it === '-') return h('div', { class: 'msep' });
         if (it.note) return h('div', { class: 'mnote' }, it.note);
-        const el = h('div', { class: 'mi' + (it.disabled ? ' disabled' : '') + (it.checked ? ' checked' : '') },
+        const el = h('div', { class: 'mi' + (it.disabled ? ' disabled' : '') + (it.checked ? ' checked' : ''), title: it.title },
           it.checked ? icon('check') : it.icon ? icon(it.icon) : icon('x', 'empty'), h('span', null, it.label), it.sc ? h('span', { class: 'sc' }, it.sc) : null);
         if (!it.disabled) el.addEventListener('click', () => { if (!it.keep) this.closeMenus(); it.fn(); });
         return el;

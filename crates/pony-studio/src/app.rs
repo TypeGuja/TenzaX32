@@ -398,6 +398,8 @@ pub struct App {
     import_count: u32,
     blank_layer_count: u32,
     asset_path: String,
+    /// Недавние файлы персонажей для меню «Файл».
+    recent_files: Vec<String>,
     xfl: XflState,
 
     poly_sides: u32,
@@ -477,6 +479,7 @@ impl App {
             import_count: 0,
             blank_layer_count: 0,
             asset_path: String::new(),
+            recent_files: if cfg!(test) { Vec::new() } else { crate::files::load_recent_files() },
             xfl: XflState { path: String::new(), doc: None, symbol: None, frame: 0, opts: pony_core::xfl::ImportOptions { scale: 1.0, expand_containers: true }, info: String::new(), show: 0 },
             poly_sides: 6,
             selected_bone: None,
@@ -1257,6 +1260,7 @@ impl App {
         }
         let loaded = Character::load_from_file(path).map_err(|err| format!("Ошибка загрузки {path}: {err}"))?;
         self.asset_path = path.to_string();
+        crate::files::remember_file(&mut self.recent_files, path);
         self.character = loaded;
         anim::pick_default_animation(&self.character, &mut self.player);
         self.player.apply(&mut self.character);
@@ -1283,6 +1287,7 @@ impl App {
                 self.history.commit_if_changed(&self.character, &self.vector_doc, &self.player);
                 self.saved_revision = self.history.revision;
                 self.status = format!("Сохранено в {}", self.asset_path);
+                crate::files::remember_file(&mut self.recent_files, &self.asset_path.clone());
                 Ok(json!({ "saved": true }))
             }
             Err(err) => Err(format!("Ошибка сохранения {}: {err}", self.asset_path)),
@@ -2233,6 +2238,7 @@ impl App {
             "undo": self.history.undo.len(),
             "redo": self.history.redo.len(),
             "asset_path": self.asset_path,
+            "recent_files": self.recent_files,
             "dirty": self.dirty(),
             "title": self.title(),
             "active_name": self.active_name,
