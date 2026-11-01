@@ -83,6 +83,30 @@ pub fn remember(dir: &Path) {
     }
 }
 
+/// Файл автосохранения и рядом — путь исходного документа (пустой, если
+/// документ ещё не сохранялся). Переживают падение программы.
+pub fn autosave_paths() -> Option<(PathBuf, PathBuf)> {
+    Some((config_file("autosave.asset")?, config_file("autosave.txt")?))
+}
+
+/// Есть ли что восстановить: (исходный путь, время автосохранения).
+pub fn autosave_pending() -> Option<(String, String)> {
+    let (asset, meta) = autosave_paths()?;
+    let modified = std::fs::metadata(&asset).ok()?.modified().ok()?;
+    let original = std::fs::read_to_string(meta).unwrap_or_default().trim().to_string();
+    Some((original, format_time(modified)))
+}
+
+pub fn autosave_clear() {
+    if cfg!(test) {
+        return;
+    }
+    if let Some((asset, meta)) = autosave_paths() {
+        let _ = std::fs::remove_file(asset);
+        let _ = std::fs::remove_file(meta);
+    }
+}
+
 const MAX_RECENT_FILES: usize = 8;
 
 /// Недавно открытые/сохранённые файлы персонажей (только существующие).

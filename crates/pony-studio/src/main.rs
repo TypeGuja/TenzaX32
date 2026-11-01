@@ -217,6 +217,7 @@ fn main() -> wry::Result<()> {
                 if app.dirty() {
                     let _ = webview.evaluate_script("window.__pony && window.__pony.confirmClose()");
                 } else {
+                    files::autosave_clear();
                     *control_flow = ControlFlow::Exit;
                 }
             }

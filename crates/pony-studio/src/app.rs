@@ -394,6 +394,8 @@ pub struct App {
     vector_doc: VectorDoc,
     history: History,
     saved_revision: u64,
+    /// Ревизия истории, записанная последним автосохранением.
+    autosaved_revision: u64,
     svg_save_count: u32,
     import_count: u32,
     blank_layer_count: u32,
@@ -475,6 +477,7 @@ impl App {
             vector_doc,
             history,
             saved_revision: 0,
+            autosaved_revision: 0,
             svg_save_count: 0,
             import_count: 0,
             blank_layer_count: 0,
@@ -643,7 +646,9 @@ impl App {
         match cmd {
             "hello" => {
                 self.last_sent.clear();
-                Ok(json!({ "scene": [SCENE_WIDTH, SCENE_HEIGHT], "fps": FPS }))
+                let recovery = if cfg!(test) { None } else { crate::files::autosave_pending() };
+                let recovery = recovery.map(|(path, time)| json!({ "path": path, "time": time }));
+                Ok(json!({ "scene": [SCENE_WIDTH, SCENE_HEIGHT], "fps": FPS, "recovery": recovery }))
             }
             "log" => {
                 eprintln!("ui: {}", a.s("text").unwrap_or(""));
@@ -675,7 +680,15 @@ impl App {
             "save" => self.save(a.s("path")),
             "import_layer" => self.import_layer(a.s("path").unwrap_or("")),
             "export" => self.export(a.s("kind").unwrap_or("gif"), a.s("path").unwrap_or("")),
+            "autosave" => self.autosave(),
+            "recover" => self.recover(),
+            "discard_recovery" => {
+                crate::files::autosave_clear();
+                Ok(Value::Null)
+            }
             "exit" => {
+                // Выход через интерфейс — пользователь уже решил судьбу правок.
+                crate::files::autosave_clear();
                 self.exit_requested = true;
                 Ok(Value::Null)
             }
@@ -1258,9 +1271,14 @@ impl App {
             self.xfl_load(path);
             return Ok(Value::Null);
         }
+        self.load_asset(path)?;
+        crate::files::remember_file(&mut self.recent_files, path);
+        Ok(Value::Null)
+    }
+
+    fn load_asset(&mut self, path: &str) -> Result<(), String> {
         let loaded = Character::load_from_file(path).map_err(|err| format!("Ошибка загрузки {path}: {err}"))?;
         self.asset_path = path.to_string();
-        crate::files::remember_file(&mut self.recent_files, path);
         self.character = loaded;
         anim::pick_default_animation(&self.character, &mut self.player);
         self.player.apply(&mut self.character);
@@ -1272,6 +1290,34 @@ impl App {
         self.saved_revision = self.history.revision;
         self.fit("character");
         self.status = format!("Загружено из {path}");
+        Ok(())
+    }
+
+    /// Пишет несохранённые правки в файл восстановления (раз в минуту из
+    /// интерфейса). Без правок или без изменений с прошлого раза — ничего.
+    fn autosave(&mut self) -> Result<Value, String> {
+        if cfg!(test) || !self.dirty() || self.history.revision == self.autosaved_revision {
+            return Ok(json!({ "saved": false }));
+        }
+        let (asset, meta) = crate::files::autosave_paths().ok_or("нет папки настроек для автосохранения")?;
+        if let Some(dir) = asset.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("автосохранение: {e}"))?;
+        }
+        self.character.save_to_file(&asset).map_err(|e| format!("автосохранение: {e}"))?;
+        std::fs::write(meta, &self.asset_path).map_err(|e| format!("автосохранение: {e}"))?;
+        self.autosaved_revision = self.history.revision;
+        Ok(json!({ "saved": true }))
+    }
+
+    /// Загружает файл восстановления; документ остаётся «несохранённым» и
+    /// привязан к исходному пути, чтобы Ctrl+S записал туда.
+    fn recover(&mut self) -> Result<Value, String> {
+        let (asset, _) = crate::files::autosave_paths().ok_or("нет папки настроек")?;
+        let (original, time) = crate::files::autosave_pending().ok_or("нечего восстанавливать")?;
+        self.load_asset(&asset.display().to_string())?;
+        self.asset_path = original;
+        self.saved_revision = u64::MAX;
+        self.status = format!("Восстановлено автосохранение от {time} — сохраните документ (Ctrl+S)");
         Ok(Value::Null)
     }
 
@@ -1288,6 +1334,7 @@ impl App {
                 self.saved_revision = self.history.revision;
                 self.status = format!("Сохранено в {}", self.asset_path);
                 crate::files::remember_file(&mut self.recent_files, &self.asset_path.clone());
+                crate::files::autosave_clear();
                 Ok(json!({ "saved": true }))
             }
             Err(err) => Err(format!("Ошибка сохранения {}: {err}", self.asset_path)),

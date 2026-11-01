@@ -554,4 +554,13 @@ window.addEventListener('DOMContentLoaded', async () => {
   requestAnimationFrame(tickLoop);
   const hello = await rpc('hello');
   if (hello) App.scene = hello.scene;
+  if (hello && hello.recovery) {
+    const r = hello.recovery;
+    const v = await confirmDialog(h('div', null, h('b', null, 'Программа закрылась, не сохранив правки.'),
+      h('p', { class: 'hint' }, `Есть автосохранение от ${r.time}${r.path ? ' (' + r.path.split(/[\\/]/).pop() + ')' : ''}. Восстановить?`)), 'Восстановить', 'Удалить');
+    if (v === true) await rpc('recover');
+    else if (v === 'extra') await rpc('discard_recovery');
+  }
+  // Автосохранение раз в минуту, только когда есть несохранённые правки.
+  setInterval(() => { if (S.ui && S.ui.dirty) rpc('autosave'); }, 60000);
 });
