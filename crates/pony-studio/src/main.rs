@@ -44,6 +44,8 @@ const UI_FILES: &[(&str, &str, &str)] = &[
 enum UserEvent {
     Ipc(String),
     JobDone(Result<String, String>),
+    /// Перетаскивание файлов в окно: над окном, брошены (`drop`) или ушли (`leave`).
+    Drag { paths: Vec<String>, drop: bool, leave: bool },
 }
 
 /// Ассеты подключены относительными путями (`assets/pony/...`) — если
@@ -134,10 +136,22 @@ fn main() -> wry::Result<()> {
 
     let proxy = event_loop.create_proxy();
     let job_proxy = event_loop.create_proxy();
+    let drop_proxy = event_loop.create_proxy();
     let builder = WebViewBuilder::new()
         .with_custom_protocol("pony".into(), |_id, request| serve(request))
         .with_ipc_handler(move |request| {
             let _ = proxy.send_event(UserEvent::Ipc(request.into_body()));
+        })
+        .with_drag_drop_handler(move |event| {
+            let to_strings = |paths: Vec<std::path::PathBuf>| paths.into_iter().map(|p| p.display().to_string()).collect();
+            let ev = match event {
+                wry::DragDropEvent::Enter { paths, .. } => UserEvent::Drag { paths: to_strings(paths), drop: false, leave: false },
+                wry::DragDropEvent::Drop { paths, .. } => UserEvent::Drag { paths: to_strings(paths), drop: true, leave: false },
+                wry::DragDropEvent::Leave => UserEvent::Drag { paths: Vec::new(), drop: false, leave: true },
+                _ => return true,
+            };
+            let _ = drop_proxy.send_event(ev);
+            true // не даём веб-панели открыть файл как страницу
         })
         .with_background_color((30, 31, 36, 255))
         .with_devtools(cfg!(debug_assertions))
@@ -192,6 +206,10 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::JobDone(result)) => {
                 let msg = app.job_done(result);
                 let _ = webview.evaluate_script(&format!("window.__pony && window.__pony.recv({msg})"));
+            }
+            Event::UserEvent(UserEvent::Drag { paths, drop, leave }) => {
+                let msg = serde_json::json!({ "paths": paths, "drop": drop, "leave": leave });
+                let _ = webview.evaluate_script(&format!("window.__pony && window.__pony.drag({msg})"));
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 // Несохранённые правки — спрашиваем в интерфейсе (он сам

@@ -69,6 +69,27 @@ window.__pony = {
     if (!renderQueued) { renderQueued = true; requestAnimationFrame(renderAll); }
     pump();
   },
+  /** Файлы, перетащенные в окно из проводника. */
+  async drag({ paths, drop, leave }) {
+    document.body.classList.toggle('dropping', !drop && !leave && paths.length > 0);
+    if (!drop) return;
+    const ext = p => (p.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
+    const asset = paths.find(p => ext(p) === 'asset');
+    const animate = paths.find(p => ['fla', 'xfl'].includes(ext(p)));
+    const layers = paths.filter(p => ['png', 'svg', 'psd', 'kra'].includes(ext(p)));
+    if (asset) {
+      if (S.ui.dirty) {
+        const v = await confirmDialog(h('div', null, h('b', null, 'Открыть другой файл?'), h('p', { class: 'hint' }, 'Несохранённые правки персонажа будут потеряны.')), 'Сохранить и открыть', 'Не сохранять');
+        if (v === false || v === undefined || (v === true && !await Actions.save())) return;
+      }
+      await rpc('open', { path: asset });
+    } else if (animate) {
+      XflWindow.open();
+      await rpc('xfl_load', { path: animate });
+    }
+    for (const p of layers) await rpc('import_layer', { path: p });
+    if (!asset && !animate && !layers.length) Chrome.status('Этот тип файла не поддерживается: .asset, .fla/.xfl, .png/.svg/.psd/.kra');
+  },
   confirmClose() {
     if (Modal.stack.some(r => r.win.classList.contains('confirm'))) return;
     confirmDialog(h('div', null, h('b', null, 'Сохранить изменения перед выходом?'), h('p', { class: 'hint' }, 'Несохранённые правки персонажа будут потеряны.')), 'Сохранить', 'Не сохранять').then(async v => {

@@ -407,3 +407,11 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--raised); bord
   padding: 5px 9px; border-radius: 6px; font-size: 11.5px; max-width: 320px; box-shadow: 0 8px 22px rgba(0,0,0,.5); line-height: 1.4;
 }
 .tip kbd { margin-left: 6px; }
+
+/* файлы тащат в окно */
+body.dropping #stage-view::after {
+  content: 'Отпусти: .asset — открыть, .fla/.xfl — импорт Animate, картинки — новые слои';
+  position: absolute; inset: 8px; display: grid; place-items: center; pointer-events: none;
+  border: 2px dashed var(--accent, #5aaaff); border-radius: 8px; background: rgba(40, 90, 160, .25);
+  color: #fff; font-size: 15px; text-align: center; padding: 16px;
+}
